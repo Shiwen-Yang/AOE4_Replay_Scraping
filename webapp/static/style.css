@@ -1,0 +1,172 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: system-ui, sans-serif;
+  font-size: 14px;
+  background: #f5f5f5;
+  color: #222;
+  padding: 20px;
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+h1 { font-size: 20px; margin-bottom: 20px; color: #111; }
+h2 { font-size: 15px; font-weight: 600; margin-bottom: 14px; color: #333; }
+
+section {
+  background: #fff;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  padding: 18px 20px;
+  margin-bottom: 16px;
+}
+
+label { display: block; font-weight: 500; margin-bottom: 4px; margin-top: 12px; }
+label:first-of-type { margin-top: 0; }
+
+input[type="text"],
+input[type="number"],
+input[type="file"],
+select {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  font-size: 13px;
+  font-family: inherit;
+}
+
+input[type="number"] { width: 100px; }
+
+.row { display: flex; gap: 16px; align-items: flex-end; flex-wrap: wrap; }
+.row > * { flex: 0 0 auto; }
+.row input[type="number"] { width: 90px; }
+
+button {
+  padding: 7px 16px;
+  border: 1px solid #999;
+  border-radius: 4px;
+  background: #f0f0f0;
+  cursor: pointer;
+  font-size: 13px;
+  font-family: inherit;
+}
+button:hover { background: #e0e0e0; }
+button.primary { background: #1a6fe8; color: #fff; border-color: #1558c0; }
+button.primary:hover { background: #1558c0; }
+button.danger { background: #e84040; color: #fff; border-color: #c02020; }
+button.danger:hover { background: #c02020; }
+button:disabled { opacity: 0.45; cursor: default; }
+
+.msg { margin-top: 10px; font-size: 13px; color: #555; min-height: 18px; }
+.msg.error { color: #c00; }
+.msg.ok { color: #080; }
+
+/* Discovery table */
+table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 12px; }
+th { text-align: left; padding: 5px 8px; background: #f0f0f0; border: 1px solid #ddd; }
+td { padding: 4px 8px; border: 1px solid #eee; font-family: monospace; font-size: 12px; }
+tr:nth-child(even) td { background: #fafafa; }
+
+/* Generated jobs list */
+.job-list { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+.job-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px;
+  background: #f8f8f8;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  font-size: 13px;
+}
+.job-item span { flex: 1; font-family: monospace; color: #444; }
+
+/* Job source toggle */
+.job-source { margin-bottom: 12px; }
+.job-source label { display: inline-flex; align-items: center; gap: 6px; margin-top: 4px; font-weight: normal; cursor: pointer; }
+.job-loaded {
+  padding: 7px 10px;
+  background: #e8f4e8;
+  border: 1px solid #aaddaa;
+  border-radius: 4px;
+  font-family: monospace;
+  font-size: 12px;
+  color: #336633;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.job-loaded button { padding: 2px 8px; font-size: 11px; }
+
+/* Progress bar */
+.progress-wrap { margin: 12px 0 8px; }
+.progress-bar {
+  height: 18px;
+  background: #e0e0e0;
+  border-radius: 9px;
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  background: #28a745;
+  border-radius: 9px;
+  transition: width 0.3s ease;
+  width: 0%;
+}
+.progress-counts { margin-top: 6px; font-size: 12px; color: #555; }
+.progress-counts span { margin-right: 14px; }
+.c-ok { color: #28a745; font-weight: 600; }
+.c-fail { color: #c00; font-weight: 600; }
+.c-skip { color: #888; }
+
+/* Log */
+.log-box {
+  height: 300px;
+  overflow-y: auto;
+  background: #111;
+  color: #ccc;
+  font-family: monospace;
+  font-size: 12px;
+  padding: 10px;
+  border-radius: 4px;
+  margin-top: 10px;
+}
+.log-line { margin-bottom: 2px; white-space: pre-wrap; word-break: break-all; }
+.log-line.ok { color: #5c5; }
+.log-line.fail { color: #f66; }
+.log-line.skip { color: #888; }
+.log-line.sleep { color: #aaa; font-style: italic; }
+.log-line.warn { color: #fa0; }
+.log-line.info { color: #8af; }
+
+.actions { display: flex; gap: 10px; margin-top: 14px; align-items: center; }
+
+/* Compact parameter rows in scraping section */
+.param-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+.param-row input[type="number"] { width: 65px; }
+.param-row input[type="text"],
+.param-row input[type="file"] { flex: 1; min-width: 120px; width: auto; }
+.param-row select { width: auto; }
+.param-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #555;
+  white-space: nowrap;
+}
+.param-sep { color: #aaa; font-size: 12px; }
+
+/* Tier summary bar */
+#tier-summary {
+  background: #f8f8f8;
+  border: 1px solid #e0e0e0;
+  border-radius: 4px;
+  padding: 6px 10px;
+  line-height: 1.6;
+}
+
+/* Import friend section file input */
+#import-file { width: auto; flex: 1; }

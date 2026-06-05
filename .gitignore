@@ -1,0 +1,28 @@
+# ── Database ──────────────────────────────────────────────────────────────────
+*.duckdb
+*.duckdb.wal
+
+# ── Replay data ───────────────────────────────────────────────────────────────
+data/replays/raw/
+data/replays/parsed/
+
+# ── Generated reports, job files, and progress sidecars ───────────────────────
+data/replays/reports/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# ── Environment / secrets ─────────────────────────────────────────────────────
+.env
+.env.*
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

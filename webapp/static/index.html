@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>AOE4 Replay Harvest — Coordinator</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<h1>AOE4 Replay Harvest <small style="font-weight:normal;font-size:13px;color:#888">— Coordinator</small></h1>
+
+<!-- ── Section 1: Discovery ─────────────────────────────────────────────── -->
+<section id="s1">
+  <h2>1. Discover Games</h2>
+  <div class="row">
+    <div>
+      <label>Days lookback</label>
+      <input type="number" id="disc-days" value="7" min="1" max="30" oninput="updateEstimate()">
+    </div>
+    <div>
+      <label>Games per tier</label>
+      <input type="number" id="disc-target" value="100" min="10" max="2000" oninput="updateEstimate()">
+    </div>
+    <div>
+      <label>API sleep (s)</label>
+      <input type="number" id="disc-sleep" value="1.5" min="0.5" max="10" step="0.5" oninput="updateEstimate()">
+    </div>
+    <div style="padding-bottom:1px">
+      <button class="primary" id="disc-btn" onclick="startDiscover()">Run Discovery</button>
+      <button id="pending-btn" onclick="showPending()" style="margin-left:8px">Show Pending</button>
+      <button id="assigned-btn" onclick="showAssigned()" style="margin-left:8px">Show Assigned</button>
+    </div>
+  </div>
+  <div style="font-size:12px;color:#888;margin-top:6px" id="disc-estimate"></div>
+  <div class="msg" id="disc-msg"></div>
+
+  <!-- Discovery progress bar (shown while running) -->
+  <div id="disc-progress-wrap" style="display:none;margin-top:10px">
+    <div class="progress-bar"><div class="progress-fill" id="disc-prog-bar"></div></div>
+    <div style="font-size:12px;color:#666;margin-top:4px" id="disc-prog-label"></div>
+  </div>
+
+  <!-- Tier summary bar -->
+  <div id="tier-summary" style="display:none;margin-top:10px;font-size:12px;color:#555;font-family:monospace"></div>
+
+  <!-- Results preview -->
+  <div id="disc-results" style="display:none">
+    <p style="margin-top:10px;font-size:13px" id="disc-summary"></p>
+    <div style="overflow-x:auto">
+      <table id="disc-table">
+        <thead><tr>
+          <th>game_id</th><th>profile_id</th><th>tier</th><th>map</th><th>season</th><th>started_at</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <!-- Assigned-mode actions (shown when viewing assigned games) -->
+    <div id="assigned-actions" style="display:none;margin-top:14px;padding:12px;background:#fffbe6;border:1px solid #ffe58f;border-radius:4px">
+      <strong style="font-size:13px">Assigned games</strong>
+      <p style="font-size:12px;color:#666;margin:4px 0 10px">
+        These games are already handed out. You can pick them up yourself, or reset them back to pending so they get included in the next job generation.
+      </p>
+      <div class="actions" style="margin-top:0">
+        <button class="primary" onclick="useAssignedAsJob()">Use all as job →</button>
+        <button onclick="resetAssigned()">Reset to pending</button>
+      </div>
+      <div class="msg" id="assigned-msg"></div>
+    </div>
+
+    <!-- Split controls (shown when viewing discovery / pending results) -->
+    <div id="split-controls" style="margin-top:16px">
+      <div class="row" style="align-items:flex-end">
+        <div>
+          <label>Split into</label>
+          <input type="number" id="split-k" value="2" min="1" max="20"> jobs
+        </div>
+        <button onclick="generateJobs()">Generate Job Files</button>
+      </div>
+      <div class="msg" id="split-msg"></div>
+      <div class="job-list" id="job-list"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ── Sync & Import ─────────────────────────────────────────────────────────── -->
+<section id="s-import">
+  <h2>Sync &amp; Import</h2>
+
+  <label style="margin-top:0">Import Friend's Progress</label>
+  <p style="font-size:12px;color:#666;margin:4px 0 8px">
+    When a friend finishes their job, they download a <em>.progress.json</em> report and send it to
+    you. Upload it here to mark their games as done so they won't be re-queued next run.
+  </p>
+  <div class="row" style="align-items:flex-end">
+    <input type="file" id="import-file" accept=".json,.progress.json" style="flex:1;width:auto">
+    <button onclick="importFriendProgress()">Import</button>
+  </div>
+  <div class="msg" id="import-msg"></div>
+
+  <div style="border-top:1px solid #eee;margin-top:16px;padding-top:14px">
+    <label>Reconcile Disk with DB</label>
+    <p style="font-size:12px;color:#666;margin:4px 0 8px">
+      Scans every <em>data/replays/</em> subfolder for downloaded <em>.gz</em> files and marks any
+      unrecorded game_ids as done in the database. Run this after collecting files from friends, or
+      if the DB got out of sync with what's on disk.
+    </p>
+    <button onclick="reconcileDisk()">Check &amp; Update Pending</button>
+    <div class="msg" id="reconcile-msg"></div>
+  </div>
+</section>
+
+<!-- ── Section 2: Scraping ──────────────────────────────────────────────── -->
+<section id="s2">
+  <h2>2. Scraping</h2>
+
+  <div class="param-row">
+    <span class="param-label">Job</span>
+    <div id="job-loaded-banner" style="display:none;flex:1">
+      <div class="job-loaded">
+        <span id="job-loaded-label">—</span>
+        <button onclick="clearLoadedJob()">✕</button>
+      </div>
+    </div>
+    <div id="job-upload-wrap" style="flex:1;display:flex">
+      <input type="file" id="job-file" accept=".json" onchange="onJobFileChange()" style="flex:1;width:auto">
+    </div>
+  </div>
+  <div class="msg" id="job-msg"></div>
+
+  <div class="param-row">
+    <span class="param-label">Sleep</span>
+    <input type="number" id="sleep-min" value="40" min="0" max="3600" step="1">
+    <span class="param-sep">—</span>
+    <input type="number" id="sleep-max" value="70" min="0" max="3600" step="1">
+    <span class="param-sep">s</span>
+  </div>
+
+  <div class="param-row">
+    <span class="param-label">Contact</span>
+    <select id="ua-method" onchange="updateUserAgent()">
+      <option value="email">Email</option>
+      <option value="Discord">Discord</option>
+      <option value="GitHub">GitHub</option>
+      <option value="other">Other</option>
+    </select>
+    <input type="text" id="ua-contact" placeholder="your@email.com" oninput="updateUserAgent()" style="flex:1;width:auto">
+  </div>
+  <div style="font-size:11px;color:#888;margin-top:2px;font-family:monospace;padding-left:60px" id="ua-preview"></div>
+
+  <div class="param-row">
+    <span class="param-label">On 429 Too Many Requests</span>
+    <select id="on-429" onchange="toggle429Sleep()">
+      <option value="sleep">Sleep then retry</option>
+      <option value="stop">Stop entirely</option>
+    </select>
+    <span id="on-429-sleep-wrap" style="display:flex;align-items:center;gap:6px">
+      every <input type="number" id="on-429-minutes" value="15" min="1" max="240" style="width:55px"> minutes
+    </span>
+  </div>
+
+  <div class="actions">
+    <button class="primary" id="start-btn" onclick="startDownload()">Start Download</button>
+    <button class="danger" id="pause-btn" onclick="pauseDownload()" disabled>Pause</button>
+  </div>
+  <div class="msg" id="start-msg"></div>
+</section>
+
+<!-- ── Section 3: Log ───────────────────────────────────────────────────── -->
+<section id="s3">
+  <h2>3. Progress</h2>
+  <div class="progress-wrap">
+    <div class="progress-bar"><div class="progress-fill" id="prog-bar"></div></div>
+    <div class="progress-counts">
+      <span><span class="c-ok" id="cnt-dl">0</span> downloaded</span>
+      <span><span class="c-fail" id="cnt-fail">0</span> failed</span>
+      <span><span class="c-skip" id="cnt-skip">0</span> skipped</span>
+      <span id="cnt-rem-wrap"><span id="cnt-rem">—</span> remaining</span>
+    </div>
+  </div>
+  <div class="log-box" id="log-box"></div>
+  <div class="msg" id="log-msg"></div>
+</section>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

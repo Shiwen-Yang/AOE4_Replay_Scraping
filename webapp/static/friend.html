@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>AOE4 Replay Harvest</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<h1>AOE4 Replay Harvest</h1>
+
+<!-- ── Section 1: Load Job ─────────────────────────────────────────────── -->
+<section id="s2">
+  <h2>1. Load Job</h2>
+
+  <div class="param-row">
+    <span class="param-label">Job</span>
+    <input type="file" id="job-file" accept=".json" onchange="onJobFileChange()" style="flex:1;width:auto">
+  </div>
+  <div class="msg" id="job-msg"></div>
+
+  <div class="param-row">
+    <span class="param-label">Sleep</span>
+    <input type="number" id="sleep-min" value="40" min="0" max="3600" step="1">
+    <span class="param-sep">—</span>
+    <input type="number" id="sleep-max" value="70" min="0" max="3600" step="1">
+    <span class="param-sep">s</span>
+  </div>
+
+  <div class="param-row">
+    <span class="param-label">Contact</span>
+    <select id="ua-method" onchange="updateUserAgent()">
+      <option value="email">Email</option>
+      <option value="Discord">Discord</option>
+      <option value="GitHub">GitHub</option>
+      <option value="other">Other</option>
+    </select>
+    <input type="text" id="ua-contact" placeholder="your@email.com" oninput="updateUserAgent()" style="flex:1;width:auto">
+  </div>
+  <div style="font-size:11px;color:#888;margin-top:2px;font-family:monospace;padding-left:60px" id="ua-preview"></div>
+
+  <div class="param-row">
+    <span class="param-label">On 429 Too Many Requests</span>
+    <select id="on-429" onchange="toggle429Sleep()">
+      <option value="sleep">Sleep then retry</option>
+      <option value="stop">Stop entirely</option>
+    </select>
+    <span id="on-429-sleep-wrap" style="display:flex;align-items:center;gap:6px">
+      every <input type="number" id="on-429-minutes" value="15" min="1" max="240" style="width:55px"> minutes
+    </span>
+  </div>
+
+  <div class="actions">
+    <button class="primary" id="start-btn" onclick="startDownload()">Start Download</button>
+    <button class="danger" id="pause-btn" onclick="pauseDownload()" disabled>Pause</button>
+  </div>
+  <div class="msg" id="start-msg"></div>
+</section>
+
+<!-- ── Section 2: Progress ─────────────────────────────────────────────── -->
+<section id="s3">
+  <h2>2. Progress</h2>
+  <div class="progress-wrap">
+    <div class="progress-bar"><div class="progress-fill" id="prog-bar"></div></div>
+    <div class="progress-counts">
+      <span><span class="c-ok" id="cnt-dl">0</span> downloaded</span>
+      <span><span class="c-fail" id="cnt-fail">0</span> failed</span>
+      <span><span class="c-skip" id="cnt-skip">0</span> skipped</span>
+      <span id="cnt-rem-wrap"><span id="cnt-rem">—</span> remaining</span>
+    </div>
+  </div>
+  <div class="log-box" id="log-box"></div>
+  <div class="msg" id="log-msg"></div>
+
+  <!-- Shown after session completes -->
+  <div id="sidecar-wrap" style="display:none;margin-top:14px;border-top:1px solid #333;padding-top:12px">
+    <p style="font-size:13px;color:#aaa;margin-bottom:8px">
+      Session complete. Send the progress report back to the coordinator so they can mark your games as done.
+    </p>
+    <a id="sidecar-link" href="#" download>
+      <button class="primary" id="sidecar-btn">Download Progress Report</button>
+    </a>
+  </div>
+</section>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
