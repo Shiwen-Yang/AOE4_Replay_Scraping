@@ -67,6 +67,19 @@ DDL = [
         notes VARCHAR
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS replay_outcome_fetches (
+        game_id BIGINT,
+        source VARCHAR,
+        profile_id_used BIGINT,
+        fetched_at TIMESTAMP,
+        status VARCHAR,
+        winner_profile_id BIGINT,
+        loser_profile_id BIGINT,
+        last_error VARCHAR,
+        PRIMARY KEY (game_id, source)
+    )
+    """,
 ]
 
 
@@ -75,6 +88,7 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_replay_downloads_group ON replay_downloads(sample_group)",
     "CREATE INDEX IF NOT EXISTS idx_replay_labels_group ON replay_candidate_labels(sample_group)",
     "CREATE INDEX IF NOT EXISTS idx_top_player_profile ON top_player_identities(profile_id)",
+    "CREATE INDEX IF NOT EXISTS idx_replay_outcomes_status ON replay_outcome_fetches(status)",
 ]
 
 
@@ -83,4 +97,3 @@ def init_schema(conn: duckdb.DuckDBPyConnection) -> None:
         conn.execute(sql)
     for sql in INDEXES:
         conn.execute(sql)
-

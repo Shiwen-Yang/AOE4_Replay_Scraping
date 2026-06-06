@@ -7,6 +7,7 @@ from .candidates import label_balanced_candidates, summarize_labels
 from .config import DB_PATH, SAMPLE_GROUP_BALANCED, SAMPLE_GROUP_RECENT, SAMPLE_GROUP_TOP100
 from .db import get_conn
 from .downloader import download_group
+from .outcomes import hydrate_outcomes, training_label_rows
 from .parser import parse_downloaded
 from .discovery import discover_tiered_games
 from .recent import discover_recent_games
@@ -133,6 +134,28 @@ def _cmd_parse_downloaded(args) -> None:
     print(counts)
 
 
+def _cmd_hydrate_outcomes(args) -> None:
+    conn = _conn(args)
+    init_schema(conn)
+    counts = hydrate_outcomes(
+        conn,
+        limit=args.limit,
+        sample_group=args.group,
+        sleep_seconds=args.sleep_seconds,
+        use_official_fallback=not args.no_official_fallback,
+    )
+    conn.close()
+    print(counts)
+
+
+def _cmd_training_labels(args) -> None:
+    conn = _conn(args, read_only=True)
+    rows = training_label_rows(conn, sample_group=args.group, limit=args.limit)
+    conn.close()
+    for row in rows:
+        print(row)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="python -m replay_harvest",
@@ -188,6 +211,18 @@ def main(argv: list[str] | None = None) -> None:
     p_parse.add_argument("--catalog-dir", default=None)
     p_parse.add_argument("--raw", action="store_true")
     p_parse.set_defaults(func=_cmd_parse_downloaded)
+
+    p_out = sub.add_parser("hydrate-outcomes", help="Fetch and store missing win/loss labels for downloaded replays")
+    p_out.add_argument("--group", default=None, choices=[SAMPLE_GROUP_BALANCED, SAMPLE_GROUP_TOP100, SAMPLE_GROUP_RECENT])
+    p_out.add_argument("--limit", type=int, default=100)
+    p_out.add_argument("--sleep-seconds", type=float, default=1.0)
+    p_out.add_argument("--no-official-fallback", action="store_true")
+    p_out.set_defaults(func=_cmd_hydrate_outcomes)
+
+    p_labels = sub.add_parser("training-labels", help="Print valid downloaded replay outcome labels")
+    p_labels.add_argument("--group", default=None, choices=[SAMPLE_GROUP_BALANCED, SAMPLE_GROUP_TOP100, SAMPLE_GROUP_RECENT])
+    p_labels.add_argument("--limit", type=int, default=None)
+    p_labels.set_defaults(func=_cmd_training_labels)
 
     p_report = sub.add_parser("report", help="Write replay sample reports")
     p_report.set_defaults(func=_cmd_report)

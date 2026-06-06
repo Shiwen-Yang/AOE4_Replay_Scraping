@@ -9,8 +9,16 @@ import duckdb
 
 from replay_harvest.candidates import bucket_for_rating, label_balanced_candidates
 from replay_harvest.downloader import download_group, download_one
+from replay_harvest.outcomes import (
+    Outcome,
+    apply_outcome,
+    hydrate_outcomes,
+    parse_aoe4world_outcome,
+    parse_official_outcome,
+    training_label_rows,
+)
 from replay_harvest.parser import parse_one
-from replay_harvest.recent import discover_recent_games
+from replay_harvest.recent import discover_recent_games, insert_game as insert_recent_game
 from replay_harvest.schema import init_schema
 from replay_harvest.top_players import label_top100_games, parse_alt_profile_ids, parse_leaderboard
 
@@ -83,6 +91,7 @@ def test_schema_creation_creates_replay_tables():
     assert "replay_candidate_labels" in tables
     assert "top_player_identities" in tables
     assert "replay_parse_runs" in tables
+    assert "replay_outcome_fetches" in tables
 
 
 def test_bucket_boundaries():
@@ -265,3 +274,129 @@ def test_discover_recent_games_inserts_and_labels_current_games():
     assert counts["labeled"] == 1
     game = conn.execute("SELECT kind, season, patch FROM games WHERE game_id = 236420367").fetchone()
     assert game == ("rm_1v1", 13, "10604")
+
+
+def test_insert_game_backfills_null_participant_results():
+    conn = make_conn()
+    conn.execute(
+        """
+        INSERT INTO games VALUES
+        (236420367, '2026-06-03 14:44:10', NULL, 1127, NULL, 'Cliffside',
+         'rm_1v1', 'UK', '10604', 13, 'old')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO participants VALUES
+        (236420367, 10427060, NULL, 'english', NULL, NULL, NULL, NULL, NULL, NULL),
+        (236420367, 6943917, NULL, 'ottomans', NULL, NULL, NULL, NULL, NULL, NULL)
+        """
+    )
+    payload = {
+        "game_id": 236420367,
+        "started_at": "2026-06-03T14:44:10.000Z",
+        "duration": 1127,
+        "map": "Cliffside",
+        "kind": "rm_1v1",
+        "server": "UK",
+        "patch": 10604,
+        "season": 13,
+        "teams": [
+            [{"player": {"profile_id": 10427060, "result": "loss", "civilization": "english", "rating": 1645}}],
+            [{"player": {"profile_id": 6943917, "result": "win", "civilization": "ottomans", "rating": 2120}}],
+        ],
+    }
+
+    assert insert_recent_game(conn, payload, "aoe4world_test")
+    rows = conn.execute(
+        """
+        SELECT profile_id, result, rating
+        FROM participants
+        WHERE game_id = 236420367
+        ORDER BY profile_id
+        """
+    ).fetchall()
+
+    assert rows == [(6943917, True, 2120), (10427060, False, 1645)]
+
+
+def test_parse_outcomes_from_api_payloads():
+    aoe4world_payload = {
+        "game": {
+            "game_id": 10,
+            "teams": [
+                [{"player": {"profile_id": 1, "result": "win"}}],
+                [{"player": {"profile_id": 2, "result": "loss"}}],
+            ],
+        }
+    }
+    official_payload = {
+        "matches": [
+            {
+                "matchhistory_id": 10,
+                "matchhistoryreportresults": [
+                    {"profile_id": 1, "resulttype": 1},
+                    {"profile_id": 2, "resulttype": 0},
+                ],
+            }
+        ]
+    }
+
+    assert parse_aoe4world_outcome(aoe4world_payload, game_id=10) == Outcome(1, 2)
+    assert parse_official_outcome(official_payload, game_id=10) == Outcome(1, 2)
+
+
+def test_apply_outcome_fills_nulls_and_preserves_conflicts():
+    conn = make_conn()
+    insert_game(conn, 20, 1500)
+    conn.execute("UPDATE participants SET result = NULL WHERE game_id = 20")
+
+    assert apply_outcome(conn, 20, Outcome(201, 202)) == "filled"
+    rows = conn.execute(
+        "SELECT profile_id, result FROM participants WHERE game_id = 20 ORDER BY profile_id"
+    ).fetchall()
+    assert rows == [(201, True), (202, False)]
+    assert apply_outcome(conn, 20, Outcome(202, 201)) == "conflict"
+    rows = conn.execute(
+        "SELECT profile_id, result FROM participants WHERE game_id = 20 ORDER BY profile_id"
+    ).fetchall()
+    assert rows == [(201, True), (202, False)]
+
+
+def test_hydrate_outcomes_records_fetch_and_training_labels(tmp_path: Path):
+    conn = make_conn()
+    insert_game(conn, 30, 1500)
+    conn.execute("UPDATE participants SET result = NULL WHERE game_id = 30")
+    conn.execute(
+        """
+        INSERT INTO replay_downloads
+        VALUES (30, 301, ?, current_date, current_timestamp, 'downloaded', 10, 'hash',
+                'test', 'recent_rm_1v1', 1, NULL)
+        """,
+        [str(tmp_path / "AgeIV_Replay_30.gz")],
+    )
+
+    def fetcher(url: str):
+        return {
+            "game_id": 30,
+            "teams": [
+                [{"player": {"profile_id": 301, "result": "win", "civilization": "English", "rating": 1500}}],
+                [{"player": {"profile_id": 302, "result": "loss", "civilization": "French", "rating": 1500}}],
+            ],
+        }
+
+    counts = hydrate_outcomes(conn, limit=10, sleep_seconds=0, fetcher=fetcher)
+    labels = training_label_rows(conn)
+    fetch_row = conn.execute(
+        """
+        SELECT status, winner_profile_id, loser_profile_id
+        FROM replay_outcome_fetches
+        WHERE game_id = 30 AND source = 'aoe4world'
+        """
+    ).fetchone()
+
+    assert counts["filled"] == 1
+    assert fetch_row == ("filled", 301, 302)
+    assert labels[0]["game_id"] == 30
+    assert labels[0]["winner_profile_id"] == 301
+    assert labels[0]["loser_profile_id"] == 302

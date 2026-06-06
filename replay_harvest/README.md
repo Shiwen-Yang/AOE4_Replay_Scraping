@@ -54,6 +54,21 @@ python -m replay_harvest download --group balanced_10k --limit 1000 --sleep-min 
 Use `--group top100_complete` to download the top-player coverage set.
 Use `--group recent_rm_1v1` to download currently discovered recent games.
 
+Fetch missing win/loss labels for downloaded replays:
+
+```bash
+python -m replay_harvest hydrate-outcomes --group recent_rm_1v1 --limit 100
+```
+
+Outcome labels are stored in `participants.result` (`true` = win,
+`false` = loss). Fetch attempts are recorded in `replay_outcome_fetches`.
+
+Print downloaded replays that have valid supervised outcome labels:
+
+```bash
+python -m replay_harvest training-labels --group recent_rm_1v1 --limit 20
+```
+
 Parse downloaded files:
 
 ```bash

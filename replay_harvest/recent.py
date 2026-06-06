@@ -110,6 +110,36 @@ def insert_game(conn: duckdb.DuckDBPyConnection, game: dict[str, Any], source_fi
         """,
         rows,
     )
+    conn.executemany(
+        """
+        UPDATE participants
+        SET
+            result = coalesce(result, ?),
+            civilization = coalesce(civilization, ?),
+            civilization_randomized = coalesce(civilization_randomized, ?),
+            rating = coalesce(rating, ?),
+            rating_diff = coalesce(rating_diff, ?),
+            mmr = coalesce(mmr, ?),
+            mmr_diff = coalesce(mmr_diff, ?),
+            input_type = coalesce(input_type, ?)
+        WHERE game_id = ? AND profile_id = ?
+        """,
+        [
+            [
+                row[2],
+                row[3],
+                row[4],
+                row[5],
+                row[6],
+                row[7],
+                row[8],
+                row[9],
+                game_id,
+                row[1],
+            ]
+            for row in rows
+        ],
+    )
     return True
 
 
