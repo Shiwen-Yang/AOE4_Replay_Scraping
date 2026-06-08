@@ -69,9 +69,10 @@ def insert_game(conn: duckdb.DuckDBPyConnection, game: dict[str, Any], source_fi
     game_id = int(game["game_id"])
     conn.execute(
         """
-        INSERT OR IGNORE INTO games
+        INSERT INTO games
             (game_id, started_at, finished_at, duration, map_id, map, kind, server, patch, season, source_file)
-        VALUES (?, ?, NULL, ?, NULL, ?, ?, ?, ?, ?, ?)
+        SELECT ?, ?, NULL, ?, NULL, ?, ?, ?, ?, ?, ?
+        WHERE NOT EXISTS (SELECT 1 FROM games WHERE game_id = ?)
         """,
         [
             game_id,
@@ -83,6 +84,7 @@ def insert_game(conn: duckdb.DuckDBPyConnection, game: dict[str, Any], source_fi
             str(game.get("patch")) if game.get("patch") is not None else None,
             game.get("season"),
             source_file,
+            game_id,
         ],
     )
     rows = []
@@ -101,15 +103,19 @@ def insert_game(conn: duckdb.DuckDBPyConnection, game: dict[str, Any], source_fi
                 player.get("input_type"),
             ]
         )
-    conn.executemany(
-        """
-        INSERT OR IGNORE INTO participants
-            (game_id, profile_id, result, civilization, civilization_randomized,
-             rating, rating_diff, mmr, mmr_diff, input_type)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        rows,
-    )
+    for row in rows:
+        conn.execute(
+            """
+            INSERT INTO participants
+                (game_id, profile_id, result, civilization, civilization_randomized,
+                 rating, rating_diff, mmr, mmr_diff, input_type)
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            WHERE NOT EXISTS (
+                SELECT 1 FROM participants WHERE game_id = ? AND profile_id = ?
+            )
+            """,
+            row + [game_id, row[1]],
+        )
     conn.executemany(
         """
         UPDATE participants
@@ -157,14 +163,20 @@ def label_games(
         "SELECT count(*) FROM replay_candidate_labels WHERE sample_group = ?",
         [group],
     ).fetchone()[0]
-    conn.executemany(
-        """
-        INSERT OR IGNORE INTO replay_candidate_labels
-            (game_id, sample_group, reason, priority, created_at)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        [(game_id, group, reason, priority, now) for game_id in sorted(game_ids)],
-    )
+    for game_id in sorted(game_ids):
+        conn.execute(
+            """
+            INSERT INTO replay_candidate_labels
+                (game_id, sample_group, reason, priority, created_at)
+            SELECT ?, ?, ?, ?, ?
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM replay_candidate_labels
+                WHERE game_id = ? AND sample_group = ?
+            )
+            """,
+            [game_id, group, reason, priority, now, game_id, group],
+        )
     after = conn.execute(
         "SELECT count(*) FROM replay_candidate_labels WHERE sample_group = ?",
         [group],

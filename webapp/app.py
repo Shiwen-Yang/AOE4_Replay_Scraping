@@ -7,7 +7,7 @@ import re
 import sys
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +51,27 @@ PENDING_JOBS: dict[str, dict] = {}
 
 # discovery background task state
 DISCOVERY: dict[str, Any] = {"status": "idle", "result": None, "error": None}
+TOP50_CACHE: dict[str, Any] = {"ids": set(), "fetched_at": None, "error": None}
+TOP50_CACHE_TTL = timedelta(minutes=15)
+
+
+def _current_top50_profile_ids() -> set[int]:
+    fetched_at = TOP50_CACHE.get("fetched_at")
+    if (
+        fetched_at is not None
+        and datetime.now(timezone.utc) - fetched_at < TOP50_CACHE_TTL
+        and TOP50_CACHE.get("ids")
+    ):
+        return set(TOP50_CACHE["ids"])
+    from replay_harvest.discovery import current_top50_profile_ids
+
+    try:
+        ids = current_top50_profile_ids()
+        TOP50_CACHE.update({"ids": set(ids), "fetched_at": datetime.now(timezone.utc), "error": None})
+        return set(ids)
+    except Exception as exc:
+        TOP50_CACHE["error"] = str(exc)
+        return set(TOP50_CACHE.get("ids") or [])
 
 
 # ── Pages ──────────────────────────────────────────────────────────────────────
@@ -68,45 +89,54 @@ def friend_page():
 # ── Discovery (coordinator only) ───────────────────────────────────────────────
 
 class DiscoverRequest(BaseModel):
-    days: int = 7
-    target_per_tier: int = 100
-    per_player: int = 25
+    quota_grid: dict[str, dict[str, int]]
+    top50_target: int = 0
+    horizon_days: list[int] | None = None
     sleep_seconds: float = 1.0
 
 
 @app.post("/api/discover/start")
 def api_discover_start(req: DiscoverRequest):
-    if DISCOVERY["status"] == "running":
+    if DISCOVERY["status"] in ("running", "stopping"):
         raise HTTPException(409, "discovery already running")
+    stop_event = threading.Event()
     DISCOVERY.update({"status": "running", "result": None, "error": None,
-                       "phase": "starting", "phases_done": 0, "phases_total": 6})
+                       "phase": "starting", "phases_done": 0, "phases_total": None,
+                       "stop_event": stop_event, "details": None})
 
     def run():
-        from replay_harvest.discovery import discover_tiered_games, PHASES_TOTAL
+        from replay_harvest.discovery import discover_quota_games
 
-        def on_phase(phase_name: str, phases_done: int, phases_total: int) -> None:
+        def on_status(details: dict[str, Any]) -> None:
             DISCOVERY.update({
-                "phase": phase_name,
-                "phases_done": phases_done,
-                "phases_total": phases_total,
+                "phase": details.get("phase", "running"),
+                "details": details,
             })
 
+        conn = None
         try:
+            top50_ids = _current_top50_profile_ids()
             conn = get_conn(DB_PATH)
             init_schema(conn)
-            result = discover_tiered_games(
+            result = discover_quota_games(
                 conn,
-                days=req.days,
-                target_per_tier=req.target_per_tier,
-                per_player=req.per_player,
+                quota_grid=req.quota_grid,
+                top50_target=req.top50_target,
+                top50_profile_ids=top50_ids,
+                horizon_days=req.horizon_days,
                 sleep_seconds=req.sleep_seconds,
-                on_phase=on_phase,
+                on_status=on_status,
+                stop_event=stop_event,
             )
-            conn.close()
-            DISCOVERY.update({"status": "done", "result": result, "error": None,
-                               "phases_done": PHASES_TOTAL, "phases_total": PHASES_TOTAL})
+            status = "stopped" if result.get("stopped") else "done"
+            DISCOVERY.update({"status": status, "result": result, "error": None,
+                               "phase": "finished", "details": result})
         except Exception as exc:
             DISCOVERY.update({"status": "error", "result": None, "error": str(exc)})
+        finally:
+            if conn is not None:
+                conn.close()
+            DISCOVERY.pop("stop_event", None)
 
     threading.Thread(target=run, daemon=True).start()
     return {"status": "started"}
@@ -114,15 +144,48 @@ def api_discover_start(req: DiscoverRequest):
 
 @app.get("/api/discover/status")
 def api_discover_status():
-    return DISCOVERY
+    return {k: v for k, v in DISCOVERY.items() if k != "stop_event"}
+
+
+@app.get("/api/quota-inventory")
+def api_quota_inventory():
+    from replay_harvest.discovery import quota_inventory
+
+    top50_ids = _current_top50_profile_ids()
+    conn = get_conn(DB_PATH)
+    try:
+        init_schema(conn)
+        result = quota_inventory(conn, top50_profile_ids=top50_ids)
+    finally:
+        conn.close()
+    result["top50_source"] = {
+        "count": len(top50_ids),
+        "error": TOP50_CACHE.get("error"),
+        "fetched_at": TOP50_CACHE.get("fetched_at").isoformat()
+        if TOP50_CACHE.get("fetched_at") else None,
+    }
+    return result
+
+
+@app.post("/api/discover/stop")
+def api_discover_stop():
+    stop_event = DISCOVERY.get("stop_event")
+    if DISCOVERY.get("status") != "running" or stop_event is None:
+        return {"status": DISCOVERY.get("status", "idle")}
+    stop_event.set()
+    DISCOVERY.update({"status": "stopping"})
+    return {"status": "stopping"}
 
 
 @app.get("/api/assigned")
 def api_assigned():
     from replay_harvest.discovery import get_assigned_games
-    conn = get_conn(DB_PATH, read_only=True)
-    result = get_assigned_games(conn)
-    conn.close()
+    conn = get_conn(DB_PATH)
+    try:
+        init_schema(conn)
+        result = get_assigned_games(conn)
+    finally:
+        conn.close()
     return result
 
 
@@ -144,6 +207,45 @@ def api_reset_assigned(req: ResetAssignedRequest):
     return {"reset": len(req.game_ids)}
 
 
+class MarkUnobtainableRequest(BaseModel):
+    game_ids: list[int]
+    reason: str = "manual_skip"
+    detail: str | None = None
+
+
+@app.post("/api/mark-unobtainable")
+def api_mark_unobtainable(req: MarkUnobtainableRequest):
+    if not req.game_ids:
+        return {"marked": 0}
+    reason = (req.reason or "manual_skip").strip()[:80]
+    detail = (req.detail or "").strip()
+    conn = get_conn(DB_PATH)
+    now = datetime.now(timezone.utc)
+    marked = 0
+    try:
+        init_schema(conn)
+        for game_id in {int(gid) for gid in req.game_ids}:
+            existing = conn.execute(
+                "SELECT status FROM replay_downloads WHERE game_id = ? LIMIT 1",
+                [game_id],
+            ).fetchone()
+            if existing and existing[0] == "downloaded":
+                continue
+            conn.execute("DELETE FROM replay_unobtainable_games WHERE game_id = ?", [game_id])
+            conn.execute(
+                """
+                INSERT INTO replay_unobtainable_games
+                    (game_id, marked_at, reason, detail, source)
+                VALUES (?, ?, ?, ?, 'manual')
+                """,
+                [game_id, now, reason, detail[:400] or None],
+            )
+            marked += 1
+    finally:
+        conn.close()
+    return {"marked": marked}
+
+
 @app.get("/api/pending")
 def api_pending():
     from replay_harvest.discovery import get_pending_games
@@ -157,9 +259,12 @@ def api_pending():
     if SESSION.job_id and not (SESSION.thread and SESSION.thread.is_alive()):
         sidecar_path = REPORT_DIR / f"{SESSION.job_id}.progress.json"
         _import_sidecar(sidecar_path, SESSION.sample_group, "coordinator_session")
-    conn = get_conn(DB_PATH, read_only=True)
-    result = get_pending_games(conn)
-    conn.close()
+    conn = get_conn(DB_PATH)
+    try:
+        init_schema(conn)
+        result = get_pending_games(conn)
+    finally:
+        conn.close()
     return result
 
 
@@ -171,14 +276,80 @@ class GenerateJobsRequest(BaseModel):
     group: str = "recent_rm_1v1"
 
 
+def _normalize_job_games(games: list[dict]) -> tuple[list[dict[str, int]], int]:
+    normalized: list[dict[str, int]] = []
+    skipped = 0
+    for game in games:
+        try:
+            game_id = int(game["game_id"])
+            profile_id = int(game["profile_id"])
+        except (KeyError, TypeError, ValueError):
+            skipped += 1
+            continue
+        normalized.append({"game_id": game_id, "profile_id": profile_id})
+    return normalized, skipped
+
+
+def _filter_unobtainable_games(games: list[dict[str, int]]) -> tuple[list[dict[str, int]], int]:
+    if not games:
+        return games, 0
+    conn = get_conn(DB_PATH)
+    try:
+        init_schema(conn)
+        game_ids = [game["game_id"] for game in games]
+        placeholders = ",".join("?" * len(game_ids))
+        excluded = {
+            int(row[0])
+            for row in conn.execute(
+                f"SELECT game_id FROM replay_unobtainable_games WHERE game_id IN ({placeholders})",
+                game_ids,
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+    if not excluded:
+        return games, 0
+    return [game for game in games if game["game_id"] not in excluded], len(excluded)
+
+
+def _mark_games_assigned(game_ids: list[int], group: str) -> None:
+    if not game_ids:
+        return
+    conn = get_conn(DB_PATH)
+    now = datetime.now(timezone.utc)
+    try:
+        for game_id in game_ids:
+            exists = conn.execute(
+                "SELECT 1 FROM replay_downloads WHERE game_id = ? LIMIT 1",
+                [game_id],
+            ).fetchone()
+            if exists:
+                continue
+            conn.execute(
+                """
+                INSERT INTO replay_downloads
+                    (game_id, profile_id_used, raw_path, download_date, downloaded_at, status,
+                     size_bytes, sha256, source, sample_group, attempt_count, last_error)
+                VALUES (?, NULL, NULL, ?, ?, 'assigned', NULL, NULL, 'job_assignment', ?, 0, NULL)
+                """,
+                [game_id, now.date(), now, group],
+            )
+    finally:
+        conn.close()
+
+
 @app.post("/api/generate-jobs")
 def api_generate_jobs(req: GenerateJobsRequest):
-    if not req.games:
-        raise HTTPException(400, "no games provided")
+    games, skipped_invalid = _normalize_job_games(req.games)
+    games, skipped_unobtainable = _filter_unobtainable_games(games)
+    if not games:
+        if skipped_unobtainable:
+            raise HTTPException(400, "all selected games are marked unobtainable")
+        raise HTTPException(400, "no games with valid game_id and profile_id provided")
 
-    k = max(1, min(req.splits, len(req.games)))
-    base = len(req.games) // k
-    remainder = len(req.games) % k
+    k = max(1, min(req.splits, len(games)))
+    base = len(games) // k
+    remainder = len(games) % k
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -187,7 +358,7 @@ def api_generate_jobs(req: GenerateJobsRequest):
 
     for i in range(k):
         size = base + (1 if i < remainder else 0)
-        chunk = req.games[start:start + size]
+        chunk = games[start:start + size]
         start += size
 
         job_id = f"job_{i + 1}_of_{k}_{ts}"
@@ -197,7 +368,7 @@ def api_generate_jobs(req: GenerateJobsRequest):
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "group": req.group,
             "total_games": len(chunk),
-            "games": [{"game_id": g["game_id"], "profile_id": g["profile_id"]} for g in chunk],
+            "games": chunk,
         }
         path = REPORT_DIR / f"{job_id}.json"
         path.write_text(json.dumps(job, indent=2))
@@ -206,22 +377,9 @@ def api_generate_jobs(req: GenerateJobsRequest):
 
     # Mark all distributed game_ids as 'assigned' so they won't be included
     # in future pending queries or handed out in a second round of jobs.
-    all_game_ids = [int(g["game_id"]) for g in req.games]
-    if all_game_ids:
-        conn = get_conn(DB_PATH)
-        now = datetime.now(timezone.utc)
-        conn.executemany(
-            """
-            INSERT OR IGNORE INTO replay_downloads
-                (game_id, profile_id_used, raw_path, download_date, downloaded_at, status,
-                 size_bytes, sha256, source, sample_group, attempt_count, last_error)
-            VALUES (?, NULL, NULL, ?, ?, 'assigned', NULL, NULL, 'job_assignment', ?, 0, NULL)
-            """,
-            [(gid, now.date(), now, req.group) for gid in all_game_ids],
-        )
-        conn.close()
+    _mark_games_assigned([g["game_id"] for g in games], req.group)
 
-    return {"jobs": jobs}
+    return {"jobs": jobs, "skipped_invalid": skipped_invalid, "skipped_unobtainable": skipped_unobtainable}
 
 
 class SaveJobRequest(BaseModel):
@@ -232,8 +390,12 @@ class SaveJobRequest(BaseModel):
 @app.post("/api/save-job")
 def api_save_job(req: SaveJobRequest):
     """Persist an in-memory job list to disk so it survives a server restart."""
-    if not req.games:
-        raise HTTPException(400, "no games provided")
+    games, skipped_invalid = _normalize_job_games(req.games)
+    games, skipped_unobtainable = _filter_unobtainable_games(games)
+    if not games:
+        if skipped_unobtainable:
+            raise HTTPException(400, "all selected games are marked unobtainable")
+        raise HTTPException(400, "no games with valid game_id and profile_id provided")
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -243,31 +405,23 @@ def api_save_job(req: SaveJobRequest):
         "job_id": job_id,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "group": req.group,
-        "total_games": len(req.games),
-        "games": [{"game_id": g["game_id"], "profile_id": g["profile_id"]} for g in req.games],
+        "total_games": len(games),
+        "games": games,
     }
     path = REPORT_DIR / f"{job_id}.json"
     path.write_text(json.dumps(job, indent=2))
     PENDING_JOBS[job_id] = job
 
     # Games were already marked 'assigned' when the original job was generated;
-    # INSERT OR IGNORE is safe to call again and ensures any new ones are covered.
-    all_game_ids = [int(g["game_id"]) for g in req.games]
-    if all_game_ids:
-        conn = get_conn(DB_PATH)
-        now = datetime.now(timezone.utc)
-        conn.executemany(
-            """
-            INSERT OR IGNORE INTO replay_downloads
-                (game_id, profile_id_used, raw_path, download_date, downloaded_at, status,
-                 size_bytes, sha256, source, sample_group, attempt_count, last_error)
-            VALUES (?, NULL, NULL, ?, ?, 'assigned', NULL, NULL, 'job_assignment', ?, 0, NULL)
-            """,
-            [(gid, now.date(), now, req.group) for gid in all_game_ids],
-        )
-        conn.close()
+    # this is safe to call again and ensures any new ones are covered.
+    _mark_games_assigned([g["game_id"] for g in games], req.group)
 
-    return {"job_id": job_id, "total_games": len(req.games)}
+    return {
+        "job_id": job_id,
+        "total_games": len(games),
+        "skipped_invalid": skipped_invalid,
+        "skipped_unobtainable": skipped_unobtainable,
+    }
 
 
 @app.get("/api/jobs/{job_id}")
@@ -500,7 +654,7 @@ def api_start(req: StartRequest):
     # even if they were downloaded on a different day or under a different job.
     job_game_ids = {int(g["game_id"]) for g in job.get("games", [])}
     try:
-        _db = get_conn(DB_PATH, read_only=True)
+        _db = get_conn(DB_PATH)
         _rows = _db.execute(
             "SELECT game_id FROM replay_downloads WHERE status = 'downloaded'"
         ).fetchall()

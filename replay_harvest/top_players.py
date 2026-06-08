@@ -173,16 +173,27 @@ def label_top100_games(
     ).fetchall()
     game_ids = [int(row[0]) for row in rows]
     if game_ids:
-        conn.executemany(
-            """
-            INSERT OR IGNORE INTO replay_candidate_labels
-                (game_id, sample_group, reason, priority, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            [
-                (game_id, SAMPLE_GROUP_TOP100, "top100_linked_identity", 0, now)
-                for game_id in game_ids
-            ],
-        )
+        for game_id in game_ids:
+            conn.execute(
+                """
+                INSERT INTO replay_candidate_labels
+                    (game_id, sample_group, reason, priority, created_at)
+                SELECT ?, ?, ?, ?, ?
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM replay_candidate_labels
+                    WHERE game_id = ? AND sample_group = ?
+                )
+                """,
+                [
+                    game_id,
+                    SAMPLE_GROUP_TOP100,
+                    "top100_linked_identity",
+                    0,
+                    now,
+                    game_id,
+                    SAMPLE_GROUP_TOP100,
+                ],
+            )
 
     return {"identities": len(identities), "games": len(game_ids)}

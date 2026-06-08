@@ -37,6 +37,7 @@ select {
 }
 
 input[type="number"] { width: 100px; }
+input[type="checkbox"] { cursor: pointer; }
 
 .row { display: flex; gap: 16px; align-items: flex-end; flex-wrap: wrap; }
 .row > * { flex: 0 0 auto; }
@@ -118,6 +119,30 @@ tr:nth-child(even) td { background: #fafafa; }
 .c-fail { color: #c00; font-weight: 600; }
 .c-skip { color: #888; }
 
+/* Discovery status */
+.discovery-status {
+  margin-top: 10px;
+  border: 1px solid #ddd;
+  background: #fafafa;
+  padding: 8px 10px;
+  border-radius: 4px;
+}
+.discovery-status-line {
+  color: #555;
+  font-family: monospace;
+  font-size: 12px;
+  margin-bottom: 7px;
+}
+.discovery-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  font-family: monospace;
+  font-size: 12px;
+}
+.discovery-metric-label { color: #666; }
+.discovery-metric-value { color: #222; font-weight: 600; }
+
 /* Log */
 .log-box {
   height: 300px;
@@ -166,6 +191,134 @@ tr:nth-child(even) td { background: #fafafa; }
   border-radius: 4px;
   padding: 6px 10px;
   line-height: 1.6;
+}
+
+.quota-grid th,
+.quota-grid td {
+  text-align: right;
+}
+.quota-grid th:first-child,
+.quota-grid td:first-child {
+  text-align: left;
+  font-family: system-ui, sans-serif;
+}
+.quota-corner {
+  position: relative;
+  width: 116px;
+  min-width: 116px;
+  height: 54px;
+  padding: 0;
+  overflow: hidden;
+  text-align: initial !important;
+}
+.quota-corner::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(to top right, transparent 49%, #bdbdbd 50%, transparent 51%);
+  pointer-events: none;
+  z-index: 1;
+}
+.corner-diff,
+.corner-tier {
+  position: absolute;
+  font-family: system-ui, sans-serif;
+  font-size: 11px;
+  line-height: 1.1;
+  z-index: 2;
+}
+.corner-diff {
+  top: 6px;
+  right: 7px;
+}
+.corner-tier {
+  left: 8px;
+  bottom: 6px;
+}
+.quota-row-label {
+  min-width: 96px;
+}
+.quota-cell {
+  min-width: 132px;
+  padding: 0;
+  background: #fff;
+}
+.quota-cell-inner {
+  display: grid;
+  grid-template-columns: minmax(82px, 2fr) minmax(42px, 1fr);
+  align-items: stretch;
+}
+.quota-cell.quota-accepting {
+  background: #eff8ee;
+}
+.quota-cell.quota-full {
+  background: #fff0f0;
+}
+.quota-subcell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 40px;
+}
+.quota-target {
+  padding: 4px 6px;
+  border-right: 1px solid #e0e0e0;
+}
+.quota-inventory {
+  color: #333;
+  font-family: monospace;
+  font-size: 12px;
+  font-weight: 600;
+}
+.quota-grid input[type="number"] {
+  width: 72px;
+  padding: 4px 6px;
+  font-family: monospace;
+}
+.quota-margin {
+  min-width: 70px;
+  color: #333;
+  font-family: monospace;
+  font-weight: 600;
+  text-align: right;
+}
+.quota-column-margins td {
+  background: #f7f7f7;
+}
+.top50-quota {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+.top50-quota label {
+  margin: 0;
+}
+.top50-cell {
+  display: inline-grid;
+  grid-template-columns: minmax(82px, 2fr) minmax(42px, 1fr);
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  overflow: hidden;
+  width: 136px;
+}
+.top50-cell input[type="number"] {
+  width: 90px;
+}
+.quota-add-custom {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.quota-add-custom input[type="number"] {
+  width: 72px;
+}
+
+#disc-table th:first-child,
+#disc-table td:first-child {
+  text-align: center;
+  width: 32px;
 }
 
 /* Import friend section file input */

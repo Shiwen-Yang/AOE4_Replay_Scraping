@@ -95,6 +95,11 @@ def label_balanced_candidates(
                   WHERE d.game_id = g.game_id
                     AND d.status = 'downloaded'
               )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM replay_unobtainable_games u
+                  WHERE u.game_id = g.game_id
+              )
               {excluded_sql}
             ORDER BY g.started_at DESC NULLS LAST, g.game_id DESC
             LIMIT ?
@@ -108,23 +113,28 @@ def label_balanced_candidates(
         if not game_ids:
             continue
 
-        conn.executemany(
-            """
-            INSERT OR IGNORE INTO replay_candidate_labels
-                (game_id, sample_group, reason, priority, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            [
-                (
+        for game_id in game_ids:
+            conn.execute(
+                """
+                INSERT INTO replay_candidate_labels
+                    (game_id, sample_group, reason, priority, created_at)
+                SELECT ?, ?, ?, ?, ?
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM replay_candidate_labels
+                    WHERE game_id = ? AND sample_group = ?
+                )
+                """,
+                [
                     game_id,
                     sample_group,
                     f"balanced_rating_bucket:{bucket.name}",
                     idx,
                     now,
-                )
-                for game_id in game_ids
-            ],
-        )
+                    game_id,
+                    sample_group,
+                ],
+            )
 
     return inserted
 
@@ -154,8 +164,10 @@ def game_ids_for_labels(
         SELECT l.game_id
         FROM replay_candidate_labels l
         LEFT JOIN replay_downloads d ON d.game_id = l.game_id
+        LEFT JOIN replay_unobtainable_games u ON u.game_id = l.game_id
         WHERE l.sample_group = ?
-          AND coalesce(d.status, '') NOT IN ('downloaded', 'assigned')
+          AND coalesce(d.status, '') NOT IN ('downloaded', 'assigned', 'unobtainable')
+          AND u.game_id IS NULL
         ORDER BY l.priority ASC, l.created_at ASC, l.game_id DESC
         LIMIT ?
         """,
@@ -163,4 +175,3 @@ def game_ids_for_labels(
     ).fetchall()
     for (game_id,) in rows:
         yield int(game_id)
-

@@ -6,6 +6,13 @@ let discoverySnapshot = null; // saved result from Run Discovery (to restore aft
 let eventSource = null;
 let jobTotal = 0;
 let autoScroll = true;
+let discoveryActive = false;
+
+const MMR_TIERS = ['low', 'mid_low', 'mid', 'high', 'elite'];
+const GAP_BUCKETS = ['0-50', '51-100', '101-200', '>200'];
+const QUOTA_STORAGE_KEY = 'aoe4_replay_quota_grid_v1';
+const TOP50_STORAGE_KEY = 'aoe4_replay_top50_target_v1';
+let quotaInventory = { matrix: emptyQuotaGrid(), top50_close: 0 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function $(id) { return document.getElementById(id); }
@@ -15,6 +22,17 @@ function setMsg(id, text, cls = '') {
   if (!el) return;
   el.textContent = text;
   el.className = 'msg' + (cls ? ' ' + cls : '');
+}
+
+async function readApiJson(resp) {
+  const text = await resp.text();
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    const fallback = text.slice(0, 200) || `${resp.status} ${resp.statusText}`;
+    throw new Error(fallback);
+  }
 }
 
 function ts() {
@@ -43,11 +61,271 @@ function updateProgress(dl, fail, skip, total) {
   if (bar) bar.style.width = pct + '%';
 }
 
+function emptyQuotaGrid(value = 0) {
+  const grid = {};
+  for (const tier of MMR_TIERS) {
+    grid[tier] = {};
+    for (const gap of GAP_BUCKETS) grid[tier][gap] = value;
+  }
+  return grid;
+}
+
+function loadQuotaGrid() {
+  let saved = null;
+  try {
+    saved = JSON.parse(localStorage.getItem(QUOTA_STORAGE_KEY) || 'null');
+  } catch {
+    saved = null;
+  }
+  const grid = emptyQuotaGrid(20);
+  if (saved && typeof saved === 'object') {
+    for (const tier of MMR_TIERS) {
+      for (const gap of GAP_BUCKETS) {
+        const value = parseInt(saved?.[tier]?.[gap]);
+        if (Number.isFinite(value) && value >= 0) grid[tier][gap] = value;
+      }
+    }
+  }
+  return grid;
+}
+
+function saveQuotaGrid() {
+  localStorage.setItem(QUOTA_STORAGE_KEY, JSON.stringify(readQuotaGrid()));
+  refreshQuotaDisplay();
+  updateEstimate();
+}
+
+function loadTop50Target() {
+  const value = parseInt(localStorage.getItem(TOP50_STORAGE_KEY) || '0');
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function readTop50Target() {
+  const value = parseInt($('top50-target')?.value || '0');
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function saveTop50Target() {
+  localStorage.setItem(TOP50_STORAGE_KEY, String(readTop50Target()));
+  refreshQuotaDisplay();
+  updateEstimate();
+}
+
+function readQuotaGrid() {
+  const grid = emptyQuotaGrid();
+  for (const tier of MMR_TIERS) {
+    for (const gap of GAP_BUCKETS) {
+      const input = document.querySelector(`[data-quota-tier="${tier}"][data-quota-gap="${gap}"]`);
+      const value = parseInt(input?.value || '0');
+      grid[tier][gap] = Number.isFinite(value) && value > 0 ? value : 0;
+    }
+  }
+  return grid;
+}
+
+function quotaTotal(grid = readQuotaGrid()) {
+  let total = 0;
+  for (const tier of MMR_TIERS) {
+    for (const gap of GAP_BUCKETS) total += grid[tier][gap] || 0;
+  }
+  return total;
+}
+
+function readDiscoveryHorizons() {
+  const raw = $('disc-horizons')?.value || '3,7,14,30';
+  const values = [];
+  for (const part of raw.split(',')) {
+    const days = parseInt(part.trim());
+    if (Number.isFinite(days) && days > 0 && days <= 365 && !values.includes(days)) {
+      values.push(days);
+    }
+  }
+  return values.length ? values : [3, 7, 14, 30];
+}
+
+function rowTotal(grid, tier) {
+  return GAP_BUCKETS.reduce((sum, gap) => sum + (grid?.[tier]?.[gap] || 0), 0);
+}
+
+function columnTotal(grid, gap) {
+  return MMR_TIERS.reduce((sum, tier) => sum + (grid?.[tier]?.[gap] || 0), 0);
+}
+
+function cellMass(targetGrid, inventoryGrid, tier, gap) {
+  return (targetGrid?.[tier]?.[gap] || 0) + (inventoryGrid?.[tier]?.[gap] || 0);
+}
+
+function percentOf(value, total) {
+  if (total <= 0) return '0%';
+  const pct = (value / total) * 100;
+  return pct >= 10 ? `${pct.toFixed(1)}%` : `${pct.toFixed(2)}%`;
+}
+
+function renderTop50QuotaControls() {
+  const input = $('top50-target');
+  if (input && input.value === '') input.value = '0';
+  const target = readTop50Target();
+  const have = quotaInventory.top50_close || 0;
+  const haveEl = $('top50-have');
+  const cell = $('top50-cell');
+  if (haveEl) haveEl.textContent = have;
+  if (cell) {
+    cell.classList.toggle('quota-accepting', target > have);
+    cell.classList.toggle('quota-full', target <= have);
+  }
+}
+
+function refreshQuotaDisplay() {
+  const grid = readQuotaGrid();
+  const inventory = quotaInventory.matrix || emptyQuotaGrid();
+  let totalMass = 0;
+  for (const tier of MMR_TIERS) {
+    for (const gap of GAP_BUCKETS) {
+      const target = grid[tier][gap] || 0;
+      const have = inventory?.[tier]?.[gap] || 0;
+      totalMass += target + have;
+      const cell = document.querySelector(`[data-quota-cell="${tier}:${gap}"]`);
+      const haveEl = document.querySelector(`[data-cell-inventory="${tier}:${gap}"]`);
+      if (haveEl) haveEl.textContent = have;
+      if (cell) {
+        cell.classList.toggle('quota-accepting', target > have);
+        cell.classList.toggle('quota-full', target <= have);
+      }
+    }
+  }
+  for (const tier of MMR_TIERS) {
+    const el = document.querySelector(`[data-row-margin="${tier}"]`);
+    const mass = rowTotal(grid, tier) + rowTotal(inventory, tier);
+    if (el) el.textContent = percentOf(mass, totalMass);
+  }
+  for (const gap of GAP_BUCKETS) {
+    const el = document.querySelector(`[data-column-margin="${gap}"]`);
+    const mass = columnTotal(grid, gap) + columnTotal(inventory, gap);
+    if (el) el.textContent = percentOf(mass, totalMass);
+  }
+  const totalEl = $('quota-total-margin');
+  if (totalEl) totalEl.textContent = totalMass > 0 ? '100%' : '0%';
+  renderTop50QuotaControls();
+}
+
+function renderQuotaGrid() {
+  const tbody = document.querySelector('#quota-grid tbody');
+  if (!tbody) return;
+  const grid = loadQuotaGrid();
+  tbody.innerHTML = '';
+  for (const tier of MMR_TIERS) {
+    const tr = document.createElement('tr');
+    const label = document.createElement('td');
+    label.className = 'quota-row-label';
+    label.textContent = tier;
+    tr.appendChild(label);
+    for (const gap of GAP_BUCKETS) {
+      const td = document.createElement('td');
+      td.className = 'quota-cell';
+      td.dataset.quotaCell = `${tier}:${gap}`;
+      const inner = document.createElement('div');
+      inner.className = 'quota-cell-inner';
+      const targetWrap = document.createElement('div');
+      targetWrap.className = 'quota-subcell quota-target';
+      const input = document.createElement('input');
+      input.type = 'number';
+      input.min = '0';
+      input.step = '1';
+      input.value = grid[tier][gap];
+      input.dataset.quotaTier = tier;
+      input.dataset.quotaGap = gap;
+      input.oninput = saveQuotaGrid;
+      targetWrap.appendChild(input);
+      inner.appendChild(targetWrap);
+      const have = document.createElement('span');
+      have.className = 'quota-subcell quota-inventory';
+      have.dataset.cellInventory = `${tier}:${gap}`;
+      have.textContent = quotaInventory.matrix?.[tier]?.[gap] || 0;
+      inner.appendChild(have);
+      td.appendChild(inner);
+      tr.appendChild(td);
+    }
+    const margin = document.createElement('td');
+    margin.className = 'quota-margin';
+    margin.dataset.rowMargin = tier;
+    tr.appendChild(margin);
+    tbody.appendChild(tr);
+  }
+  const marginRow = document.createElement('tr');
+  marginRow.className = 'quota-column-margins';
+  const label = document.createElement('td');
+  label.textContent = 'marginal';
+  marginRow.appendChild(label);
+  for (const gap of GAP_BUCKETS) {
+    const td = document.createElement('td');
+    td.className = 'quota-margin';
+    td.dataset.columnMargin = gap;
+    marginRow.appendChild(td);
+  }
+  const total = document.createElement('td');
+  total.className = 'quota-margin';
+  total.id = 'quota-total-margin';
+  marginRow.appendChild(total);
+  tbody.appendChild(marginRow);
+  refreshQuotaDisplay();
+}
+
+function addQuotaGrid(delta) {
+  const add = Math.max(0, parseInt(delta || '0'));
+  if (!Number.isFinite(add) || add <= 0) return;
+  for (const input of document.querySelectorAll('#quota-grid input[type="number"]')) {
+    const current = parseInt(input.value || '0');
+    input.value = (Number.isFinite(current) && current > 0 ? current : 0) + add;
+  }
+  saveQuotaGrid();
+}
+
+function addCustomQuotaGrid() {
+  addQuotaGrid($('quota-add-custom')?.value || '0');
+}
+
+function clearQuotaGrid() {
+  for (const input of document.querySelectorAll('#quota-grid input[type="number"]')) {
+    input.value = 0;
+  }
+  saveQuotaGrid();
+}
+
+async function loadQuotaInventory() {
+  try {
+    const resp = await fetch('/api/quota-inventory');
+    const data = await readApiJson(resp);
+    if (!resp.ok) return;
+    quotaInventory = {
+      matrix: data.matrix || emptyQuotaGrid(),
+      top50_close: data.top50_close || 0,
+    };
+    renderQuotaGrid();
+    updateEstimate();
+  } catch {
+    // Keep the UI usable if AoE4World is temporarily unavailable.
+  }
+}
+
 function setRunning(running) {
   const start = $('start-btn');
   const pause = $('pause-btn');
   if (start) start.disabled = running;
   if (pause) pause.disabled = !running;
+}
+
+function setDiscoveryRunning(running, stopping = false) {
+  discoveryActive = running || stopping;
+  const btn = $('disc-btn');
+  if (!btn) return;
+  btn.disabled = stopping;
+  btn.textContent = stopping ? 'Stopping...' : (running ? 'Stop Discovery' : 'Start Discovery');
+  btn.className = running || stopping ? 'danger' : 'primary';
+}
+
+async function toggleDiscover() {
+  if (discoveryActive) await stopDiscover();
+  else await startDiscover();
 }
 
 // ── SSE connection ────────────────────────────────────────────────────────────
@@ -165,7 +443,14 @@ function toggle429Sleep() {
 
 // auto-scroll toggle
 document.addEventListener('DOMContentLoaded', () => {
+  const top50Input = $('top50-target');
+  if (top50Input) {
+    top50Input.value = loadTop50Target();
+    top50Input.oninput = saveTop50Target;
+  }
+  renderQuotaGrid();
   updateEstimate();
+  loadQuotaInventory();
   const box = $('log-box');
   if (box) {
     box.addEventListener('scroll', () => {
@@ -182,6 +467,15 @@ document.addEventListener('DOMContentLoaded', () => {
       setRunning(true);
       connectSSE();
       appendLog(`${ts()} [resumed — session already running]`, 'info');
+    }
+  }).catch(() => {});
+
+  fetch('/api/discover/status').then(r => r.json()).then(s => {
+    if (s.status === 'running' || s.status === 'stopping') {
+      setDiscoveryRunning(true, s.status === 'stopping');
+      if (s.details) renderTierSummary(s.details, s.status);
+      pollDiscovery();
+      discoverPollTimer = setInterval(pollDiscovery, 2000);
     }
   }).catch(() => {});
 });
@@ -317,30 +611,106 @@ function formatTier(raw) {
 function renderTierSummary(result, label) {
   const el = $('tier-summary');
   if (!el) return;
-  const parts = [];
-  if (result.top50) parts.push(`Top50: ${result.top50.games_found}`);
-  for (const t of ['elite', 'high', 'mid', 'low_mid', 'low']) {
-    if (result[t] != null) parts.push(`${t}: ${result[t].games_found}`);
+  if (result.deficits && result.distribution) {
+    const stats = result.stats || {};
+    const deficitTotal = Object.values(result.deficits)
+      .flatMap(row => Object.values(row))
+      .reduce((a, b) => a + b, 0);
+    const unbucketableParts = Object.entries(stats)
+      .filter(([key, value]) => key.startsWith('unbucketable_') && value > 0)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([key, value]) => `${key.replace('unbucketable_', '')}:${value}`);
+    el.textContent =
+      `deficit:${deficitTotal}` +
+      (result.top50_deficit != null ? `  |  top50 deficit:${result.top50_deficit}` : '') +
+      `  |  profiles:${stats.profiles_scanned || 0}` +
+      `  |  skipped:${stats.profiles_skipped_cooldown || 0}` +
+      `  |  games:${stats.games_checked || 0}` +
+      `  |  not aligned:${stats.quota_rejected || 0}` +
+      `  |  duplicates:${stats.duplicates || 0}` +
+      `  |  unbucketable:${stats.unbucketable || 0}` +
+      (unbucketableParts.length ? ` (${unbucketableParts.join(',')})` : '') +
+      `  |  accepted:${stats.accepted || 0}` +
+      (stats.top50_accepted ? `  |  top50 accepted:${stats.top50_accepted}` : '') +
+      `  |  new:${result.total_new ?? stats.new_labels ?? 0}` +
+      `  |  pending:${result.total_pending ?? '—'}` +
+      `  |  calls:${stats.api_calls || 0}` +
+      `  |  429:${stats.http_429 || 0}` +
+      (result.horizon_days ? `  |  horizon:${result.horizon_days}d` : '') +
+      (label ? `  [${label}]` : '');
+  } else {
+    const parts = [];
+    if (result.top50) parts.push(`Top50: ${result.top50.games_found}`);
+    for (const t of ['elite', 'high', 'mid', 'low_mid', 'low']) {
+      if (result[t] != null) parts.push(`${t}: ${result[t].games_found}`);
+    }
+    const totalNew = result.total_new != null ? `  |  ${result.total_new} new` : '';
+    const pending = result.total_pending != null ? ` / ${result.total_pending} pending` : '';
+    el.textContent = parts.join('  |  ') + totalNew + pending + (label ? `  [${label}]` : '');
   }
-  const totalNew = result.total_new != null ? `  |  ${result.total_new} new` : '';
-  const pending = result.total_pending != null ? ` / ${result.total_pending} pending` : '';
-  el.textContent = parts.join('  |  ') + totalNew + pending + (label ? `  [${label}]` : '');
   el.style.display = 'block';
+}
+
+function renderDiscoveryStatus(details, status) {
+  const wrap = $('disc-status-wrap');
+  const line = $('disc-status-line');
+  const metrics = $('disc-status-metrics');
+  if (!wrap || !line || !metrics) return;
+  const stats = details.stats || {};
+  const deficitTotal = details.deficits
+    ? Object.values(details.deficits).flatMap(row => Object.values(row)).reduce((a, b) => a + b, 0)
+    : 0;
+  const runningLabel = status === 'stopping' ? 'Stopping' : 'Running';
+  line.textContent = `${runningLabel} — phase:${details.phase || 'scanning'} horizon:${details.horizon_days || '—'}d deficit:${deficitTotal}`;
+  const rows = [
+    ['profiles', stats.profiles_scanned || 0],
+    ['skipped', stats.profiles_skipped_cooldown || 0],
+    ['games', stats.games_checked || 0],
+    ['not aligned', stats.quota_rejected || 0],
+    ['accepted', stats.accepted || 0],
+    ['new', stats.new_labels || 0],
+    ['duplicates', stats.duplicates || 0],
+    ['unbucketable', stats.unbucketable || 0],
+    ['calls', stats.api_calls || 0],
+    ['429', stats.http_429 || 0],
+  ];
+  for (const [key, value] of Object.entries(stats)) {
+    if (key.startsWith('unbucketable_') && value > 0) {
+      rows.push([key.replace('unbucketable_', ''), value]);
+    }
+  }
+  metrics.innerHTML = rows.map(([label, value]) => (
+    `<span><span class="discovery-metric-label">${label}:</span> ` +
+    `<span class="discovery-metric-value">${value}</span></span>`
+  )).join('');
+  wrap.style.display = 'block';
 }
 
 function renderDiscoveryTable(games) {
   const tbody = document.querySelector('#disc-table tbody');
   if (!tbody) return;
   tbody.innerHTML = '';
-  const preview = games.slice(0, 20);
+  const preview = games.slice(0, 200);
   for (const g of preview) {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${g.game_id}</td><td>${g.profile_id ?? '—'}</td><td>${formatTier(g.tier)}</td><td>${g.map ?? '—'}</td><td>${g.season ?? '—'}</td><td>${(g.started_at || '—').slice(0, 19)}</td>`;
+    tr.innerHTML = `
+      <td><input type="checkbox" class="game-select" value="${g.game_id}"></td>
+      <td>${g.game_id}</td>
+      <td>${g.profile_id ?? '—'}</td>
+      <td>${g.match_tier ?? formatTier(g.tier)}</td>
+      <td>${g.gap_bucket ?? '—'}${g.mmr_gap != null ? ` (${g.mmr_gap})` : ''}</td>
+      <td>${g.avg_mmr ?? '—'}</td>
+      <td>${g.map ?? '—'}</td>
+      <td>${g.season ?? '—'}</td>
+      <td>${(g.started_at || '—').slice(0, 19)}</td>`;
     tbody.appendChild(tr);
   }
+  const selectAll = $('select-all-games');
+  if (selectAll) selectAll.checked = false;
   const sumEl = $('disc-summary');
   if (sumEl) {
-    sumEl.textContent = `${games.length} games total${games.length > 20 ? ' (showing first 20)' : ''}`;
+    sumEl.textContent = `${games.length} games total${games.length > 200 ? ' (showing first 200)' : ''}`;
   }
 }
 
@@ -372,8 +742,10 @@ function setViewMode(mode) {
   currentViewMode = mode;
   const assignedActions = $('assigned-actions');
   const splitControls = $('split-controls');
+  const unobtainableActions = $('unobtainable-actions');
   if (assignedActions) assignedActions.style.display = mode === 'assigned' ? 'block' : 'none';
   if (splitControls)   splitControls.style.display   = mode !== 'assigned' ? 'block' : 'none';
+  if (unobtainableActions) unobtainableActions.style.display = (mode === 'pending' || mode === 'assigned') ? 'block' : 'none';
 }
 
 // ── Coordinator: "Show Pending" ───────────────────────────────────────────────
@@ -451,7 +823,7 @@ async function useAssignedAsJob() {
         group: 'recent_rm_1v1',
       }),
     });
-    const data = await resp.json();
+    const data = await readApiJson(resp);
     if (!resp.ok) {
       setMsg('assigned-msg', data.detail || 'Failed to save job.', 'error');
       return;
@@ -467,7 +839,8 @@ async function useAssignedAsJob() {
     if (uploadWrap) uploadWrap.style.display = 'none';
     const label = $('job-loaded-label');
     if (label) label.textContent = `${data.job_id}  (${data.total_games} games)`;
-    setMsg('job-msg', `Job saved to disk as ${data.job_id}.json — you can re-upload this file to resume after a server restart.`, 'ok');
+    const skipped = data.skipped_invalid ? ` Skipped ${data.skipped_invalid} games without a usable profile_id.` : '';
+    setMsg('job-msg', `Job saved to disk as ${data.job_id}.json — you can re-upload this file to resume after a server restart.${skipped}`, 'ok');
     setMsg('assigned-msg', '', '');
 
     const s2 = $('s2');
@@ -497,6 +870,48 @@ async function resetAssigned() {
     setTimeout(() => { $('disc-results').style.display = 'none'; }, 1500);
   } catch (err) {
     setMsg('assigned-msg', `Error: ${err}`, 'error');
+  }
+}
+
+function selectedGameIds() {
+  return Array.from(document.querySelectorAll('.game-select:checked'))
+    .map(input => parseInt(input.value))
+    .filter(Number.isFinite);
+}
+
+function toggleSelectAllGames() {
+  const checked = $('select-all-games')?.checked || false;
+  for (const input of document.querySelectorAll('.game-select')) {
+    input.checked = checked;
+  }
+}
+
+async function markSelectedUnobtainable() {
+  const gameIds = selectedGameIds();
+  if (!gameIds.length) {
+    setMsg('unobtainable-msg', 'Select at least one visible game first.', 'error');
+    return;
+  }
+  const reason = $('unobtainable-reason')?.value || 'manual_skip';
+  const detail = $('unobtainable-detail')?.value || '';
+  setMsg('unobtainable-msg', `Marking ${gameIds.length} games unobtainable…`, '');
+  try {
+    const resp = await fetch('/api/mark-unobtainable', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ game_ids: gameIds, reason, detail }),
+    });
+    const data = await readApiJson(resp);
+    if (!resp.ok) {
+      setMsg('unobtainable-msg', data.detail || 'Failed to mark games.', 'error');
+      return;
+    }
+    setMsg('unobtainable-msg', `${data.marked} games marked unobtainable.`, 'ok');
+    loadQuotaInventory();
+    if (currentViewMode === 'assigned') await showAssigned();
+    else await showPending();
+  } catch (err) {
+    setMsg('unobtainable-msg', `Request failed: ${err}`, 'error');
   }
 }
 
@@ -533,37 +948,35 @@ function formatDuration(seconds) {
 function updateEstimate() {
   const el = $('disc-estimate');
   if (!el) return;
-  const target = parseInt($('disc-target')?.value || '100');
-  const perPlayer = 25;  // backend default
   const sleep = parseFloat($('disc-sleep')?.value || '1.5');
-  // Top50: 1 leaderboard + 50 player calls
-  const top50Calls = 51;
-  // Per tier: ~2 leaderboard pages + players needed (assume avg 40% of per_player games available)
-  const avgGamesPerPlayer = Math.max(1, perPlayer * 0.4);
-  const playersPerTier = Math.ceil(target / avgGamesPerPlayer);
-  const callsPerTier = 2 + playersPerTier;
-  const totalCalls = top50Calls + 5 * callsPerTier;
-  const secs = Math.round(totalCalls * sleep);
-  el.textContent = `Estimated runtime: ${formatDuration(secs)} (${totalCalls} API calls × ${sleep}s)`;
+  const matrixTotal = quotaTotal();
+  const top50Target = readTop50Target();
+  const horizons = readDiscoveryHorizons();
+  const total = matrixTotal + top50Target;
+  el.textContent = `Targets: ${total} pipeline games (${matrixTotal} matrix + ${top50Target} top-50 close). Discovery checks ${horizons.join('/')} day windows, 50 games per player call, sleeping ${sleep}s between API calls. Elite means non-top-50 games with avg MMR >= 1400; elite/top-50 accept only close gaps.`;
 }
 
 async function startDiscover() {
-  const days = parseInt($('disc-days')?.value || '7');
-  const targetPerTier = parseInt($('disc-target')?.value || '100');
+  const quotaGrid = readQuotaGrid();
+  const top50Target = readTop50Target();
+  const horizons = readDiscoveryHorizons();
+  if (quotaTotal(quotaGrid) + top50Target <= 0) {
+    setMsg('disc-msg', 'Enter at least one positive quota-grid or top-50 target.', 'error');
+    return;
+  }
   const sleepSeconds = parseFloat($('disc-sleep')?.value || '1.5');
 
-  $('disc-btn').disabled = true;
+  setDiscoveryRunning(true);
   $('disc-results').style.display = 'none';
   const ts_ = $('tier-summary');
   if (ts_) ts_.style.display = 'none';
 
-  // Show progress bar
-  const pw = $('disc-progress-wrap');
-  const pb = $('disc-prog-bar');
-  const pl = $('disc-prog-label');
-  if (pw) pw.style.display = 'block';
-  if (pb) pb.style.width = '0%';
-  if (pl) pl.textContent = 'Fetching top 50 players…';
+  const sw = $('disc-status-wrap');
+  const sl = $('disc-status-line');
+  const sm = $('disc-status-metrics');
+  if (sw) sw.style.display = 'none';
+  if (sl) sl.textContent = 'Starting quota-aware discovery...';
+  if (sm) sm.innerHTML = '';
 
   setMsg('disc-msg', 'Discovery running…', '');
 
@@ -571,20 +984,35 @@ async function startDiscover() {
     const resp = await fetch('/api/discover/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ days, target_per_tier: targetPerTier, sleep_seconds: sleepSeconds }),
+      body: JSON.stringify({
+        quota_grid: quotaGrid,
+        top50_target: top50Target,
+        horizon_days: horizons,
+        sleep_seconds: sleepSeconds,
+      }),
     });
     if (!resp.ok) {
-      const d = await resp.json();
+      const d = await readApiJson(resp);
       setMsg('disc-msg', d.detail || 'Failed to start discovery.', 'error');
-      $('disc-btn').disabled = false;
-      if (pw) pw.style.display = 'none';
+      setDiscoveryRunning(false);
+      if (sw) sw.style.display = 'none';
       return;
     }
     discoverPollTimer = setInterval(pollDiscovery, 2000);
   } catch (err) {
     setMsg('disc-msg', `Error: ${err}`, 'error');
-    $('disc-btn').disabled = false;
-    if (pw) pw.style.display = 'none';
+    setDiscoveryRunning(false);
+    if (sw) sw.style.display = 'none';
+  }
+}
+
+async function stopDiscover() {
+  setDiscoveryRunning(true, true);
+  setMsg('disc-msg', 'Stopping discovery after the current safe checkpoint…', '');
+  try {
+    await fetch('/api/discover/stop', { method: 'POST' });
+  } catch (err) {
+    setMsg('disc-msg', `Stop failed: ${err}`, 'error');
   }
 }
 
@@ -593,41 +1021,34 @@ async function pollDiscovery() {
     const resp = await fetch('/api/discover/status');
     const data = await resp.json();
 
-    if (data.status === 'running') {
-      // Update progress bar
-      const done = data.phases_done || 0;
-      const total = data.phases_total || 6;
-      const pct = Math.round((done / total) * 100);
-      const pb = $('disc-prog-bar');
-      const pl = $('disc-prog-label');
-      if (pb) pb.style.width = pct + '%';
-      if (pl) {
-        const completedLabel = PHASE_NAMES[data.phase] || data.phase || '';
-        const nextLabel = NEXT_PHASE[data.phase] || '';
-        pl.textContent = `${done}/${total} phases — ${completedLabel}${nextLabel ? ' · ' + nextLabel : ''}`;
-      }
+    if (data.status === 'running' || data.status === 'stopping') {
+      const details = data.details || {};
+      details.phase = data.phase || details.phase;
+      if (details.deficits) renderTierSummary(details, data.status);
       return;
     }
 
     clearInterval(discoverPollTimer);
     discoverPollTimer = null;
-    $('disc-btn').disabled = false;
-    const pw = $('disc-progress-wrap');
+    setDiscoveryRunning(false);
+    const sw = $('disc-status-wrap');
 
     if (data.status === 'error') {
       setMsg('disc-msg', `Discovery failed: ${data.error}`, 'error');
-      if (pw) pw.style.display = 'none';
+      if (sw) sw.style.display = 'none';
       return;
     }
 
-    if (pw) pw.style.display = 'none';
+    if (sw) sw.style.display = 'none';
     const result = data.result;
     discoveredGames = result.games || [];
     discoverySnapshot = result;
     const old = $('back-to-discovery-btn');
     if (old) old.remove();
-    setMsg('disc-msg', `Discovery complete — ${result.total_new} new games, ${result.total_pending} total pending.`, 'ok');
-    renderTierSummary(result, 'discovery');
+    const label = data.status === 'stopped' ? 'Discovery stopped' : 'Discovery complete';
+    setMsg('disc-msg', `${label} — ${result.total_new} new games, ${result.total_pending} total pending.`, 'ok');
+    loadQuotaInventory();
+    renderTierSummary(result, data.status);
     renderDiscoveryTable(discoveredGames);
     setViewMode('discovery');
     $('disc-results').style.display = 'block';
@@ -635,7 +1056,7 @@ async function pollDiscovery() {
     clearInterval(discoverPollTimer);
     discoverPollTimer = null;
     setMsg('disc-msg', `Poll error: ${err}`, 'error');
-    $('disc-btn').disabled = false;
+    setDiscoveryRunning(false);
   }
 }
 
@@ -658,12 +1079,13 @@ async function generateJobs() {
         group: 'recent_rm_1v1',
       }),
     });
-    const data = await resp.json();
+    const data = await readApiJson(resp);
     if (!resp.ok) {
       setMsg('split-msg', data.detail || 'Failed.', 'error');
       return;
     }
-    setMsg('split-msg', `Generated ${data.jobs.length} job files.`, 'ok');
+    const skipped = data.skipped_invalid ? ` Skipped ${data.skipped_invalid} games without a usable profile_id.` : '';
+    setMsg('split-msg', `Generated ${data.jobs.length} job files.${skipped}`, 'ok');
     renderJobList(data.jobs);
   } catch (err) {
     setMsg('split-msg', `Error: ${err}`, 'error');

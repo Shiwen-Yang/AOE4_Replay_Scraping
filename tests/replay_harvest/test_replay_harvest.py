@@ -9,6 +9,7 @@ import duckdb
 
 from replay_harvest.candidates import bucket_for_rating, label_balanced_candidates
 from replay_harvest.downloader import download_group, download_one
+from replay_harvest.discovery import discover_quota_games, game_cell, quota_deficits, quota_distribution, quota_inventory
 from replay_harvest.outcomes import (
     Outcome,
     apply_outcome,
@@ -89,6 +90,8 @@ def test_schema_creation_creates_replay_tables():
     tables = {row[0] for row in conn.execute("SHOW TABLES").fetchall()}
     assert "replay_downloads" in tables
     assert "replay_candidate_labels" in tables
+    assert "replay_unobtainable_games" in tables
+    assert "replay_discovery_profile_windows" in tables
     assert "top_player_identities" in tables
     assert "replay_parse_runs" in tables
     assert "replay_outcome_fetches" in tables
@@ -320,6 +323,62 @@ def test_insert_game_backfills_null_participant_results():
     assert rows == [(6943917, True, 2120), (10427060, False, 1645)]
 
 
+def test_insert_game_works_without_table_constraints():
+    conn = duckdb.connect(":memory:")
+    conn.execute(
+        """
+        CREATE TABLE games (
+            game_id BIGINT,
+            started_at TIMESTAMP,
+            finished_at TIMESTAMP,
+            duration INTEGER,
+            map_id BIGINT,
+            map VARCHAR,
+            kind VARCHAR,
+            server VARCHAR,
+            patch VARCHAR,
+            season INTEGER,
+            source_file VARCHAR
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE participants (
+            game_id BIGINT,
+            profile_id BIGINT,
+            result BOOLEAN,
+            civilization VARCHAR,
+            civilization_randomized BOOLEAN,
+            rating INTEGER,
+            rating_diff INTEGER,
+            mmr INTEGER,
+            mmr_diff INTEGER,
+            input_type VARCHAR
+        )
+        """
+    )
+    payload = {
+        "game_id": 236420368,
+        "started_at": "2026-06-03T14:44:10.000Z",
+        "duration": 1127,
+        "map": "Cliffside",
+        "kind": "rm_1v1",
+        "server": "UK",
+        "patch": 10604,
+        "season": 13,
+        "teams": [
+            [{"player": {"profile_id": 10427060, "result": "loss", "civilization": "english", "rating": 1645}}],
+            [{"player": {"profile_id": 6943917, "result": "win", "civilization": "ottomans", "rating": 2120}}],
+        ],
+    }
+
+    assert insert_recent_game(conn, payload, "aoe4world_test")
+    assert insert_recent_game(conn, payload, "aoe4world_test")
+    assert conn.execute("SELECT count(*) FROM games").fetchone()[0] == 1
+    assert conn.execute("SELECT count(*) FROM participants").fetchone()[0] == 2
+
+
 def test_parse_outcomes_from_api_payloads():
     aoe4world_payload = {
         "game": {
@@ -400,3 +459,399 @@ def test_hydrate_outcomes_records_fetch_and_training_labels(tmp_path: Path):
     assert labels[0]["game_id"] == 30
     assert labels[0]["winner_profile_id"] == 301
     assert labels[0]["loser_profile_id"] == 302
+
+
+def test_game_cell_uses_mmr_then_rating_and_buckets_gap():
+    conn = make_conn()
+    insert_game(conn, 40, 1000)
+    conn.execute("UPDATE participants SET mmr = 1500 WHERE game_id = 40 AND profile_id = 401")
+    conn.execute("UPDATE participants SET mmr = 1540 WHERE game_id = 40 AND profile_id = 402")
+
+    cell = game_cell(conn, 40)
+
+    assert cell["match_tier"] == "elite"
+    assert cell["gap_bucket"] == "0-50"
+    assert cell["avg_mmr"] == 1520
+    assert cell["mmr_gap"] == 40
+
+
+def test_quota_distribution_excludes_unobtainable_games():
+    conn = make_conn()
+    insert_game(conn, 41, 1100)
+    insert_game(conn, 42, 1100)
+    conn.execute(
+        """
+        INSERT INTO replay_candidate_labels VALUES
+        (41, 'recent_rm_1v1', 'quota:high:0-50', 0, current_timestamp),
+        (42, 'recent_rm_1v1', 'quota:high:0-50', 0, current_timestamp)
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO replay_unobtainable_games
+        VALUES (42, current_timestamp, 'manual_skip', NULL, 'manual')
+        """
+    )
+
+    distribution = quota_distribution(conn)
+    deficits = quota_deficits(
+        {"low": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+         "mid_low": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+         "mid": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+         "high": {"0-50": 2, "51-100": 0, "101-200": 0, ">200": 0},
+         "elite": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0}},
+        distribution,
+    )
+
+    assert distribution["high"]["0-50"] == 1
+    assert deficits["high"]["0-50"] == 1
+
+
+def test_quota_inventory_separates_top50_close_games_from_matrix():
+    conn = make_conn()
+    insert_game(conn, 43, 1500, 1540)
+    insert_game(conn, 44, 1500, 1540)
+    conn.execute("UPDATE participants SET profile_id = 4301 WHERE game_id = 43 AND profile_id = 431")
+    conn.execute(
+        """
+        INSERT INTO replay_candidate_labels VALUES
+        (43, 'recent_rm_1v1', 'quota:top50_close', 0, current_timestamp),
+        (44, 'recent_rm_1v1', 'quota:elite:0-50', 1, current_timestamp)
+        """
+    )
+
+    inventory = quota_inventory(conn, top50_profile_ids={4301})
+
+    assert inventory["top50_close"] == 1
+    assert inventory["matrix"]["elite"]["0-50"] == 1
+
+
+def test_discover_quota_games_accepts_matching_quota_cell():
+    conn = make_conn()
+    quota = {
+        "low": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "mid_low": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "mid": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "high": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "elite": {"0-50": 1, "51-100": 0, "101-200": 0, ">200": 0},
+    }
+    game_payload = {
+        "game_id": 236420367,
+        "started_at": "2026-06-03T14:44:10.000Z",
+        "duration": 1127,
+        "map": "Cliffside",
+        "kind": "rm_1v1",
+        "server": "UK",
+        "patch": 10604,
+        "season": 13,
+        "teams": [
+            [{"player": {"profile_id": 10427060, "result": "loss", "civilization": "english", "rating": 1500}}],
+            [{"player": {"profile_id": 6943917, "result": "win", "civilization": "ottomans", "rating": 1530}}],
+        ],
+    }
+
+    def fetcher(url: str):
+        if "leaderboards" in url:
+            return {"players": [{"profile_id": 10427060}]}
+        return {"games": [game_payload]}
+
+    result = discover_quota_games(
+        conn,
+        quota,
+        sleep_seconds=0,
+        fetcher=fetcher,
+        max_api_calls=2,
+        horizon_days=[5],
+    )
+
+    assert result["horizons"] == [5]
+    assert result["total_new"] == 1
+    assert result["distribution"]["elite"]["0-50"] == 1
+    assert result["stats"]["api_calls"] == 2
+    assert result["stats"]["profiles_scanned"] == 1
+    assert result["stats"]["games_checked"] == 1
+    assert result["stats"]["accepted"] == 1
+
+
+def test_discover_quota_games_accepts_top50_close_target():
+    conn = make_conn()
+    quota = {
+        "low": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "mid_low": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "mid": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "high": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "elite": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+    }
+    game_payload = {
+        "game_id": 90,
+        "started_at": "2026-06-03T14:44:10.000Z",
+        "duration": 1127,
+        "map": "Cliffside",
+        "kind": "rm_1v1",
+        "server": "UK",
+        "patch": 10604,
+        "season": 13,
+        "teams": [
+            [{"player": {"profile_id": 9001, "result": "loss", "civilization": "english", "rating": 1800}}],
+            [{"player": {"profile_id": 9002, "result": "win", "civilization": "ottomans", "rating": 1860}}],
+        ],
+    }
+
+    def fetcher(url: str):
+        return {"games": [game_payload]}
+
+    result = discover_quota_games(
+        conn,
+        quota,
+        top50_target=1,
+        top50_profile_ids={9001},
+        sleep_seconds=0,
+        fetcher=fetcher,
+        max_api_calls=1,
+    )
+
+    assert result["top50_inventory"] == 1
+    assert result["distribution"]["elite"]["51-100"] == 0
+    assert result["stats"]["top50_accepted"] == 1
+    assert result["total_new"] == 1
+
+
+def test_discover_quota_games_rejects_top50_wide_gap_target():
+    conn = make_conn()
+    quota = {
+        "low": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "mid_low": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "mid": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "high": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "elite": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+    }
+    game_payload = {
+        "game_id": 91,
+        "started_at": "2026-06-03T14:44:10.000Z",
+        "duration": 1127,
+        "map": "Cliffside",
+        "kind": "rm_1v1",
+        "server": "UK",
+        "patch": 10604,
+        "season": 13,
+        "teams": [
+            [{"player": {"profile_id": 9101, "result": "loss", "civilization": "english", "rating": 1800}}],
+            [{"player": {"profile_id": 9102, "result": "win", "civilization": "ottomans", "rating": 2050}}],
+        ],
+    }
+
+    def fetcher(url: str):
+        return {"games": [game_payload]}
+
+    result = discover_quota_games(
+        conn,
+        quota,
+        top50_target=1,
+        top50_profile_ids={9101},
+        sleep_seconds=0,
+        fetcher=fetcher,
+        max_api_calls=1,
+    )
+
+    assert result["top50_inventory"] == 0
+    assert result["stats"]["top50_gap_rejected"] == 1
+    assert result["total_new"] == 0
+
+
+def test_discover_quota_games_reports_unbucketable_reason():
+    conn = make_conn()
+    quota = {
+        "low": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "mid_low": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "mid": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "high": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "elite": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+    }
+    game_payload = {
+        "game_id": 92,
+        "started_at": "2026-06-03T14:44:10.000Z",
+        "duration": 1127,
+        "map": "Cliffside",
+        "kind": "rm_1v1",
+        "server": "UK",
+        "patch": 10604,
+        "season": 13,
+        "teams": [
+            [{"player": {"profile_id": 9201, "result": "loss", "civilization": "english"}}],
+            [{"player": {"profile_id": 9202, "result": "win", "civilization": "ottomans", "rating": 1200}}],
+        ],
+    }
+
+    def fetcher(url: str):
+        return {"games": [game_payload]}
+
+    result = discover_quota_games(
+        conn,
+        quota,
+        top50_target=1,
+        top50_profile_ids={9201},
+        sleep_seconds=0,
+        fetcher=fetcher,
+        max_api_calls=1,
+    )
+
+    assert result["stats"]["unbucketable"] == 1
+    assert result["stats"]["unbucketable_missing_rating"] == 1
+    assert result["total_new"] == 0
+
+
+
+def test_discover_quota_games_cools_down_zero_accepted_profile_windows():
+    conn = make_conn()
+    quota = {
+        "low": {"0-50": 1, "51-100": 0, "101-200": 0, ">200": 0},
+        "mid_low": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "mid": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "high": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "elite": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+    }
+    game_payload = {
+        "game_id": 50,
+        "started_at": "2026-06-03T14:44:10.000Z",
+        "duration": 1127,
+        "map": "Cliffside",
+        "kind": "rm_1v1",
+        "server": "UK",
+        "patch": 10604,
+        "season": 13,
+        "teams": [
+            [{"player": {"profile_id": 5001, "result": "loss", "civilization": "english", "rating": 1500}}],
+            [{"player": {"profile_id": 5002, "result": "win", "civilization": "ottomans", "rating": 1530}}],
+        ],
+    }
+
+    def fetcher(url: str):
+        if "leaderboards" in url:
+            return {"players": [{"profile_id": 5001}]}
+        return {"games": [game_payload]}
+
+    first = discover_quota_games(conn, quota, sleep_seconds=0, fetcher=fetcher, max_api_calls=2)
+    second = discover_quota_games(conn, quota, sleep_seconds=0, fetcher=fetcher, max_api_calls=2)
+    conn.execute(
+        """
+        UPDATE replay_discovery_profile_windows
+        SET sampled_at = current_timestamp - INTERVAL 49 HOURS
+        WHERE profile_id = 5001 AND horizon_days = 3
+        """
+    )
+    third = discover_quota_games(conn, quota, sleep_seconds=0, fetcher=fetcher, max_api_calls=2)
+
+    assert first["stats"]["profiles_scanned"] == 1
+    assert first["stats"]["games_checked"] == 1
+    assert first["stats"]["quota_rejected"] == 1
+    assert first["stats"]["accepted"] == 0
+    assert second["stats"]["profiles_scanned"] == 0
+    assert second["stats"]["profiles_skipped_cooldown"] > 0
+    assert third["stats"]["profiles_scanned"] == 1
+
+
+def test_discover_quota_games_cools_down_empty_profile_windows_longer():
+    conn = make_conn()
+    quota = {
+        "low": {"0-50": 1, "51-100": 0, "101-200": 0, ">200": 0},
+        "mid_low": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "mid": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "high": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "elite": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+    }
+
+    def fetcher(url: str):
+        if "leaderboards" in url:
+            return {"players": [{"profile_id": 6001}]}
+        return {"games": []}
+
+    first = discover_quota_games(conn, quota, sleep_seconds=0, fetcher=fetcher, max_api_calls=2)
+    second = discover_quota_games(conn, quota, sleep_seconds=0, fetcher=fetcher, max_api_calls=2)
+    conn.execute(
+        """
+        UPDATE replay_discovery_profile_windows
+        SET sampled_at = current_timestamp - INTERVAL 97 HOURS
+        WHERE profile_id = 6001 AND horizon_days = 3
+        """
+    )
+    third = discover_quota_games(conn, quota, sleep_seconds=0, fetcher=fetcher, max_api_calls=2)
+
+    assert first["stats"]["profiles_scanned"] == 1
+    assert first["stats"]["games_checked"] == 0
+    assert second["stats"]["profiles_scanned"] == 0
+    assert second["stats"]["profiles_skipped_cooldown"] > 0
+    assert third["stats"]["profiles_scanned"] == 1
+
+
+def test_discover_quota_games_does_not_cool_down_accepted_profile_windows():
+    conn = make_conn()
+    quota = {
+        "low": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "mid_low": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "mid": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "high": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "elite": {"0-50": 1, "51-100": 0, "101-200": 0, ">200": 0},
+    }
+    game_payload = {
+        "game_id": 70,
+        "started_at": "2026-06-03T14:44:10.000Z",
+        "duration": 1127,
+        "map": "Cliffside",
+        "kind": "rm_1v1",
+        "server": "UK",
+        "patch": 10604,
+        "season": 13,
+        "teams": [
+            [{"player": {"profile_id": 7001, "result": "loss", "civilization": "english", "rating": 1500}}],
+            [{"player": {"profile_id": 7002, "result": "win", "civilization": "ottomans", "rating": 1530}}],
+        ],
+    }
+
+    def fetcher(url: str):
+        if "leaderboards" in url:
+            return {"players": [{"profile_id": 7001}]}
+        return {"games": [game_payload]}
+
+    first = discover_quota_games(conn, quota, sleep_seconds=0, fetcher=fetcher, max_api_calls=2)
+    second = discover_quota_games(conn, quota, sleep_seconds=0, fetcher=fetcher, max_api_calls=2)
+
+    assert first["stats"]["accepted"] == 1
+    assert second["stats"]["profiles_scanned"] == 1
+    assert second["stats"]["profiles_skipped_cooldown"] == 0
+
+
+def test_discover_quota_games_rejects_wide_gap_elite_matches():
+    conn = make_conn()
+    quota = {
+        "low": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "mid_low": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "mid": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "high": {"0-50": 0, "51-100": 0, "101-200": 0, ">200": 0},
+        "elite": {"0-50": 0, "51-100": 0, "101-200": 1, ">200": 1},
+    }
+    game_payload = {
+        "game_id": 80,
+        "started_at": "2026-06-03T14:44:10.000Z",
+        "duration": 1127,
+        "map": "Cliffside",
+        "kind": "rm_1v1",
+        "server": "UK",
+        "patch": 10604,
+        "season": 13,
+        "teams": [
+            [{"player": {"profile_id": 8001, "result": "loss", "civilization": "english", "rating": 1500}}],
+            [{"player": {"profile_id": 8002, "result": "win", "civilization": "ottomans", "rating": 1800}}],
+        ],
+    }
+
+    def fetcher(url: str):
+        if "leaderboards" in url:
+            return {"players": [{"profile_id": 8001}]}
+        return {"games": [game_payload]}
+
+    result = discover_quota_games(conn, quota, sleep_seconds=0, fetcher=fetcher, max_api_calls=2)
+
+    assert result["stats"]["games_checked"] == 1
+    assert result["stats"]["quota_rejected"] == 1
+    assert result["stats"]["accepted"] == 0
+    assert result["total_new"] == 0

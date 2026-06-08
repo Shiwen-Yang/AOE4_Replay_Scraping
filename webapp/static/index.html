@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <title>AOE4 Replay Harvest — Coordinator</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v=quota-discovery-11">
 </head>
 <body>
 <h1>AOE4 Replay Harvest <small style="font-weight:normal;font-size:13px;color:#888">— Coordinator</small></h1>
@@ -11,21 +11,47 @@
 <!-- ── Section 1: Discovery ─────────────────────────────────────────────── -->
 <section id="s1">
   <h2>1. Discover Games</h2>
-  <div class="row">
-    <div>
-      <label>Days lookback</label>
-      <input type="number" id="disc-days" value="7" min="1" max="30" oninput="updateEstimate()">
+  <div>
+    <label>Quota grid</label>
+    <div style="overflow-x:auto">
+      <table id="quota-grid" class="quota-grid">
+        <thead><tr>
+          <th class="quota-corner"><span class="corner-diff">MMR diff</span><span class="corner-tier">MMR tier</span></th>
+          <th>0-50</th><th>51-100</th><th>101-200</th><th>&gt;200</th><th>marginal</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
     </div>
+    <div class="top50-quota">
+      <label for="top50-target">Top 50 close games</label>
+      <div id="top50-cell" class="quota-cell top50-cell">
+        <div class="quota-subcell quota-target">
+          <input type="number" id="top50-target" value="0" min="0" step="1">
+        </div>
+        <span id="top50-have" class="quota-subcell quota-inventory">0</span>
+      </div>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button onclick="addQuotaGrid(50)">+50/cell</button>
+      <div class="quota-add-custom">
+        <button onclick="addCustomQuotaGrid()">+</button>
+        <input type="number" id="quota-add-custom" value="20" min="0" step="1">
+        <span>/cell</span>
+      </div>
+      <button onclick="clearQuotaGrid()">Clear</button>
+    </div>
+  </div>
+  <div class="row" style="margin-top:12px">
     <div>
-      <label>Games per tier</label>
-      <input type="number" id="disc-target" value="100" min="10" max="2000" oninput="updateEstimate()">
+      <label>Horizons (days)</label>
+      <input type="text" id="disc-horizons" value="3,7,14,30" oninput="updateEstimate()">
     </div>
     <div>
       <label>API sleep (s)</label>
       <input type="number" id="disc-sleep" value="1.5" min="0.5" max="10" step="0.5" oninput="updateEstimate()">
     </div>
     <div style="padding-bottom:1px">
-      <button class="primary" id="disc-btn" onclick="startDiscover()">Run Discovery</button>
+      <button class="primary" id="disc-btn" onclick="toggleDiscover()">Start Discovery</button>
       <button id="pending-btn" onclick="showPending()" style="margin-left:8px">Show Pending</button>
       <button id="assigned-btn" onclick="showAssigned()" style="margin-left:8px">Show Assigned</button>
     </div>
@@ -33,10 +59,10 @@
   <div style="font-size:12px;color:#888;margin-top:6px" id="disc-estimate"></div>
   <div class="msg" id="disc-msg"></div>
 
-  <!-- Discovery progress bar (shown while running) -->
-  <div id="disc-progress-wrap" style="display:none;margin-top:10px">
-    <div class="progress-bar"><div class="progress-fill" id="disc-prog-bar"></div></div>
-    <div style="font-size:12px;color:#666;margin-top:4px" id="disc-prog-label"></div>
+  <!-- Discovery status counters (shown while running) -->
+  <div id="disc-status-wrap" class="discovery-status" style="display:none">
+    <div class="discovery-status-line" id="disc-status-line">Starting quota-aware discovery...</div>
+    <div class="discovery-metrics" id="disc-status-metrics"></div>
   </div>
 
   <!-- Tier summary bar -->
@@ -48,10 +74,32 @@
     <div style="overflow-x:auto">
       <table id="disc-table">
         <thead><tr>
-          <th>game_id</th><th>profile_id</th><th>tier</th><th>map</th><th>season</th><th>started_at</th>
+          <th><input type="checkbox" id="select-all-games" onchange="toggleSelectAllGames()"></th>
+          <th>game_id</th><th>profile_id</th><th>tier</th><th>gap</th><th>avg</th><th>map</th><th>season</th><th>started_at</th>
         </tr></thead>
         <tbody></tbody>
       </table>
+    </div>
+    <div id="unobtainable-actions" style="display:none;margin-top:12px;padding:12px;background:#fff8f0;border:1px solid #ffd7a8;border-radius:4px">
+      <strong style="font-size:13px">Mark unobtainable</strong>
+      <div class="row" style="margin-top:8px;align-items:flex-end">
+        <div>
+          <label>Reason</label>
+          <select id="unobtainable-reason">
+            <option value="manual_skip">manual_skip</option>
+            <option value="replay_expired">replay_expired</option>
+            <option value="download_404">download_404</option>
+            <option value="no_profile_id">no_profile_id</option>
+            <option value="other">other</option>
+          </select>
+        </div>
+        <div style="flex:1">
+          <label>Detail</label>
+          <input type="text" id="unobtainable-detail" placeholder="optional">
+        </div>
+        <button class="danger" onclick="markSelectedUnobtainable()">Mark selected</button>
+      </div>
+      <div class="msg" id="unobtainable-msg"></div>
     </div>
 
     <!-- Assigned-mode actions (shown when viewing assigned games) -->
@@ -181,6 +229,6 @@
   <div class="msg" id="log-msg"></div>
 </section>
 
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=quota-discovery-11"></script>
 </body>
 </html>

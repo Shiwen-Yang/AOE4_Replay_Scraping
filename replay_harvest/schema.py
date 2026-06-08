@@ -31,6 +31,28 @@ DDL = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS replay_unobtainable_games (
+        game_id BIGINT PRIMARY KEY,
+        marked_at TIMESTAMP,
+        reason VARCHAR,
+        detail VARCHAR,
+        source VARCHAR
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS replay_discovery_profile_windows (
+        profile_id BIGINT,
+        horizon_days INTEGER,
+        sampled_at TIMESTAMP,
+        games_checked INTEGER,
+        accepted INTEGER,
+        quota_rejected INTEGER,
+        duplicates INTEGER,
+        unbucketable INTEGER,
+        PRIMARY KEY (profile_id, horizon_days)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS top_player_identities (
         canonical_profile_id BIGINT,
         profile_id BIGINT,
@@ -87,6 +109,8 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_replay_downloads_status ON replay_downloads(status)",
     "CREATE INDEX IF NOT EXISTS idx_replay_downloads_group ON replay_downloads(sample_group)",
     "CREATE INDEX IF NOT EXISTS idx_replay_labels_group ON replay_candidate_labels(sample_group)",
+    "CREATE INDEX IF NOT EXISTS idx_replay_unobtainable_source ON replay_unobtainable_games(source)",
+    "CREATE INDEX IF NOT EXISTS idx_replay_discovery_windows_sampled ON replay_discovery_profile_windows(sampled_at)",
     "CREATE INDEX IF NOT EXISTS idx_top_player_profile ON top_player_identities(profile_id)",
     "CREATE INDEX IF NOT EXISTS idx_replay_outcomes_status ON replay_outcome_fetches(status)",
 ]
