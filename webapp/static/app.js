@@ -354,10 +354,16 @@ function connectSSE() {
       // Show sidecar download button on friend page
       const sidecarWrap = $('sidecar-wrap');
       const sidecarLink = $('sidecar-link');
+      const eventLogLink = $('event-log-link');
       if (sidecarWrap && sidecarLink && currentJobId) {
         const fname = currentJobId + '.progress.json';
         sidecarLink.href = `/api/sidecar/${encodeURIComponent(currentJobId)}`;
         sidecarLink.download = fname;
+        if (eventLogLink) {
+          const eventLogName = currentJobId + '.events.jsonl';
+          eventLogLink.href = `/api/event-log/${encodeURIComponent(currentJobId)}`;
+          eventLogLink.download = eventLogName;
+        }
         sidecarWrap.style.display = 'block';
       }
       return;

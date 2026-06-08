@@ -440,6 +440,14 @@ def api_download_sidecar(job_id: str):
     return FileResponse(path, filename=f"{job_id}.progress.json", media_type="application/json")
 
 
+@app.get("/api/event-log/{job_id}")
+def api_download_event_log(job_id: str):
+    path = REPORT_DIR / f"{job_id}.events.jsonl"
+    if not path.exists():
+        raise HTTPException(404, "event log not found — session may not have started yet")
+    return FileResponse(path, filename=f"{job_id}.events.jsonl", media_type="application/x-ndjson")
+
+
 class ImportProgressRequest(BaseModel):
     job_id: str
     downloaded: list[int]

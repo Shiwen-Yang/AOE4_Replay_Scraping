@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from email.message import Message
 import gzip
+import json
 from urllib.error import HTTPError
 from pathlib import Path
 import subprocess
@@ -8,7 +10,7 @@ import subprocess
 import duckdb
 
 from replay_harvest.candidates import bucket_for_rating, label_balanced_candidates
-from replay_harvest.downloader import download_group, download_one
+from replay_harvest.downloader import download_group, download_job_list, download_one
 from replay_harvest.discovery import discover_quota_games, game_cell, quota_deficits, quota_distribution, quota_inventory
 from replay_harvest.outcomes import (
     Outcome,
@@ -211,6 +213,46 @@ def test_download_group_handles_429_without_crashing(tmp_path: Path):
     assert counts["failed"] == 1
     row = conn.execute("SELECT status, last_error FROM replay_downloads WHERE game_id = 124").fetchone()
     assert row == ("failed", "http_429")
+
+
+def test_download_job_list_writes_rate_limit_event_log(tmp_path: Path):
+    job_path = tmp_path / "job_rate_limit.json"
+    job_path.write_text(
+        json.dumps({
+            "job_id": "job_rate_limit",
+            "group": "recent_rm_1v1",
+            "games": [{"game_id": 125, "profile_id": 1500}],
+        })
+    )
+    headers = Message()
+    headers["Retry-After"] = "90"
+    headers["X-RateLimit-Remaining"] = "0"
+    headers["X-RateLimit-Reset"] = "1780000000"
+
+    def fetcher(game_id, profile_id, user_agent):
+        raise HTTPError("url", 429, "Too Many Requests", hdrs=headers, fp=None)
+
+    counts = download_job_list(
+        job_path,
+        raw_root=tmp_path / "raw",
+        sleep_min=0,
+        sleep_max=0,
+        on_429="stop",
+        fetcher=fetcher,
+    )
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "job_rate_limit.events.jsonl").read_text().splitlines()
+    ]
+    http_event = next(event for event in events if event["event"] == "http_error")
+
+    assert counts["failed"] == 1
+    assert http_event["http_status"] == 429
+    assert http_event["action"] == "stop"
+    assert http_event["headers"]["Retry-After"] == "90"
+    assert http_event["headers"]["X-RateLimit-Remaining"] == "0"
+    assert http_event["headers"]["X-RateLimit-Reset"] == "1780000000"
+    assert any(event["event"] == "game_result" and event["error"] == "http_429" for event in events)
 
 
 def test_parse_one_records_success(tmp_path: Path):

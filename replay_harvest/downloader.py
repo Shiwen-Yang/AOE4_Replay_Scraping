@@ -23,6 +23,15 @@ class RetryableDownloadError(RuntimeError):
         self.pause_seconds = pause_seconds
 
 
+RATE_LIMIT_HEADERS = [
+    "Retry-After",
+    "X-RateLimit-Limit",
+    "X-RateLimit-Remaining",
+    "X-RateLimit-Reset",
+    "X-RateLimit-Used",
+]
+
+
 def _today_raw_dir(raw_root: Path = RAW_REPLAY_DIR) -> Path:
     path = raw_root / date.today().isoformat()
     path.mkdir(parents=True, exist_ok=True)
@@ -53,6 +62,27 @@ def fetch_replay_bytes(
     req = Request(url, headers={"User-Agent": user_agent})
     with urlopen(req, timeout=120) as resp:
         return resp.read()
+
+
+def _utc_now() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+
+def _selected_headers(headers) -> dict[str, str]:
+    if not headers:
+        return {}
+    selected: dict[str, str] = {}
+    for name in RATE_LIMIT_HEADERS:
+        value = headers.get(name)
+        if value is not None:
+            selected[name] = str(value)
+    return selected
+
+
+def _append_jsonl(path: Path, event: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(event, sort_keys=True) + "\n")
 
 
 def _record_download(
@@ -207,6 +237,7 @@ def download_job_list(
     sleep_min: float = 40.0,
     sleep_max: float = 70.0,
     user_agent: str = USER_AGENT,
+    fetcher=fetch_replay_bytes,
     on_event=None,
     stop_event: threading.Event | None = None,
     on_429: str = "sleep",          # "sleep" or "stop"
@@ -223,11 +254,13 @@ def download_job_list(
     job = json.loads(job_path.read_text())
     job_id = job.get("job_id", job_path.stem)
     sidecar_path = job_path.parent / f"{job_id}.progress.json"
+    event_log_path = job_path.parent / f"{job_id}.events.jsonl"
 
     if sidecar_path.exists():
         progress_data: dict = json.loads(sidecar_path.read_text())
     else:
         progress_data = {"job_id": job_id, "results": {}}
+    progress_data["event_log"] = event_log_path.name
 
     done_ids = {
         int(k)
@@ -239,6 +272,9 @@ def download_job_list(
 
     counts: dict[str, int] = {"downloaded": 0, "failed": 0, "skipped": 0}
     games = job.get("games", [])
+
+    def _log(evt: dict) -> None:
+        _append_jsonl(event_log_path, {"at": _utc_now(), "job_id": job_id, **evt})
 
     def _save():
         progress_data["updated_at"] = datetime.utcnow().isoformat()
@@ -255,8 +291,18 @@ def download_job_list(
         time.sleep(seconds)
         return False
 
+    _log({
+        "event": "session_start",
+        "total_games": len(games),
+        "sleep_min": sleep_min,
+        "sleep_max": sleep_max,
+        "on_429": on_429,
+        "on_429_minutes": on_429_minutes,
+    })
+
     for idx, entry in enumerate(games):
         if stop_event and stop_event.is_set():
+            _log({"event": "paused", "index": idx, "reason": "stop_requested"})
             _emit({"type": "paused", "index": idx})
             break
 
@@ -265,6 +311,13 @@ def download_job_list(
 
         if game_id in done_ids:
             counts["skipped"] += 1
+            _log({
+                "event": "game_skipped",
+                "index": idx,
+                "game_id": game_id,
+                "profile_id": profile_id,
+                "reason": "already_downloaded",
+            })
             _emit({"type": "log", "game_id": game_id, "status": "skipped", "index": idx})
             continue
 
@@ -274,13 +327,29 @@ def download_job_list(
         path_str: str | None = None
 
         for attempt in range(2):
+            _log({
+                "event": "attempt_start",
+                "index": idx,
+                "attempt": attempt + 1,
+                "game_id": game_id,
+                "profile_id": profile_id,
+            })
             try:
                 if final_path.exists() and final_path.stat().st_size > 0:
                     status = "downloaded"
                     path_str = str(final_path)
+                    _log({
+                        "event": "local_file_used",
+                        "index": idx,
+                        "attempt": attempt + 1,
+                        "game_id": game_id,
+                        "profile_id": profile_id,
+                        "path": path_str,
+                        "size_bytes": final_path.stat().st_size,
+                    })
                     break
 
-                data = fetch_replay_bytes(game_id, profile_id, user_agent=user_agent)
+                data = fetcher(game_id, profile_id, user_agent=user_agent)
                 if len(data) == 0:
                     raise ValueError("empty response body")
                 if not data.startswith(b"\x1f\x8b"):
@@ -290,83 +359,186 @@ def download_job_list(
                 tmp.replace(final_path)
                 status = "downloaded"
                 path_str = str(final_path)
+                _log({
+                    "event": "attempt_success",
+                    "index": idx,
+                    "attempt": attempt + 1,
+                    "game_id": game_id,
+                    "profile_id": profile_id,
+                    "size_bytes": len(data),
+                })
                 break
 
             except HTTPError as exc:
                 error = f"http_{exc.code}"
+                headers = _selected_headers(exc.headers)
+                http_event = {
+                    "event": "http_error",
+                    "index": idx,
+                    "attempt": attempt + 1,
+                    "game_id": game_id,
+                    "profile_id": profile_id,
+                    "http_status": exc.code,
+                    "reason": exc.reason,
+                    "headers": headers,
+                }
                 if exc.code == 429:
                     if on_429 == "stop":
+                        _log({**http_event, "action": "stop"})
                         _emit({"type": "log", "game_id": game_id, "status": "rate_limited",
-                               "message": "429 — stopping as configured", "index": idx})
+                               "message": "429 — stopping as configured", "index": idx,
+                               "headers": headers})
                         if stop_event:
                             stop_event.set()
                         break
                     elif attempt == 0:
                         mins = on_429_minutes
+                        _log({**http_event, "action": "sleep_then_retry", "sleep_seconds": mins * 60})
                         _emit({"type": "log", "game_id": game_id, "status": "rate_limited",
-                               "message": f"429 — sleeping {mins:.0f} min then retrying", "index": idx})
+                               "message": f"429 — sleeping {mins:.0f} min then retrying", "index": idx,
+                               "headers": headers})
                         if _sleep(mins * 60):
+                            _log({
+                                "event": "sleep_interrupted",
+                                "index": idx,
+                                "game_id": game_id,
+                                "profile_id": profile_id,
+                                "reason": "stop_requested",
+                            })
                             break
                         continue
+                    else:
+                        _log({**http_event, "action": "final_failed"})
                 elif exc.code == 404:
                     error = "http_404_replay_unavailable"
+                    _log({**http_event, "action": "skip_unavailable"})
                     _emit({"type": "log", "game_id": game_id, "status": "warn",
                            "message": "404 — replay not available (may have expired)", "index": idx})
                 elif exc.code == 403:
                     error = "http_403_access_denied"
+                    _log({**http_event, "action": "skip_access_denied"})
                     _emit({"type": "log", "game_id": game_id, "status": "warn",
                            "message": "403 — access denied, skipping", "index": idx})
                 elif 500 <= exc.code <= 599 and attempt == 0:
+                    _log({**http_event, "action": "sleep_then_retry", "sleep_seconds": 120})
                     _emit({"type": "log", "game_id": game_id, "status": "warn",
                            "message": f"http_{exc.code} — server error, retrying in 2 min", "index": idx})
                     if _sleep(120):
+                        _log({
+                            "event": "sleep_interrupted",
+                            "index": idx,
+                            "game_id": game_id,
+                            "profile_id": profile_id,
+                            "reason": "stop_requested",
+                        })
                         break
                     continue
+                else:
+                    _log({**http_event, "action": "final_failed"})
                 break
 
             except TimeoutError:
                 error = "timeout"
+                _log({
+                    "event": "timeout",
+                    "index": idx,
+                    "attempt": attempt + 1,
+                    "game_id": game_id,
+                    "profile_id": profile_id,
+                    "action": "sleep_then_retry" if attempt == 0 else "final_failed",
+                })
                 if attempt == 0:
                     _emit({"type": "log", "game_id": game_id, "status": "warn",
                            "message": "timeout — retrying in 30s", "index": idx})
                     if _sleep(30):
+                        _log({
+                            "event": "sleep_interrupted",
+                            "index": idx,
+                            "game_id": game_id,
+                            "profile_id": profile_id,
+                            "reason": "stop_requested",
+                        })
                         break
                     continue
                 break
 
             except URLError as exc:
                 error = f"network_error: {str(exc.reason)[:80]}"
+                _log({
+                    "event": "network_error",
+                    "index": idx,
+                    "attempt": attempt + 1,
+                    "game_id": game_id,
+                    "profile_id": profile_id,
+                    "reason": str(exc.reason)[:200],
+                    "action": "sleep_then_retry" if attempt == 0 else "final_failed",
+                })
                 if attempt == 0:
                     _emit({"type": "log", "game_id": game_id, "status": "warn",
                            "message": f"network error — retrying in 30s", "index": idx})
                     if _sleep(30):
+                        _log({
+                            "event": "sleep_interrupted",
+                            "index": idx,
+                            "game_id": game_id,
+                            "profile_id": profile_id,
+                            "reason": "stop_requested",
+                        })
                         break
                     continue
                 break
 
             except (ValueError, OSError) as exc:
                 error = str(exc)[:200]
+                _log({
+                    "event": "download_error",
+                    "index": idx,
+                    "attempt": attempt + 1,
+                    "game_id": game_id,
+                    "profile_id": profile_id,
+                    "error": error,
+                    "action": "final_failed",
+                })
                 break
 
+        finished_at = _utc_now()
         progress_data["results"][str(game_id)] = {
             "status": status,
             "path": path_str,
             "error": error,
-            "at": datetime.utcnow().isoformat(),
+            "at": finished_at,
         }
         _save()
         counts[status] = counts.get(status, 0) + 1
+        _log({
+            "event": "game_result",
+            "index": idx,
+            "game_id": game_id,
+            "profile_id": profile_id,
+            "status": status,
+            "error": error,
+            "path": path_str,
+            "counts": dict(counts),
+        })
         _emit({"type": "log", "game_id": game_id, "status": status, "error": error,
                "path": path_str, "index": idx})
 
         if stop_event and stop_event.is_set():
+            _log({"event": "paused", "index": idx, "reason": "stop_requested"})
             _emit({"type": "paused", "index": idx})
             break
 
         if idx < len(games) - 1:
             pause = random.uniform(sleep_min, sleep_max)
+            _log({
+                "event": "sleep_between_games",
+                "index": idx,
+                "game_id": game_id,
+                "seconds": round(pause, 1),
+            })
             _emit({"type": "sleep", "seconds": round(pause, 1), "index": idx})
             _sleep(pause)
 
+    _log({"event": "session_done", "counts": counts, "total_games": len(games)})
     _emit({"type": "done", "counts": counts, "total": len(games)})
     return counts
