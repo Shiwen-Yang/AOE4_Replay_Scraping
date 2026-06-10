@@ -3,6 +3,10 @@
 Tools for acquiring raw Age of Empires IV replay files against the existing
 `aoe4.duckdb` match warehouse.
 
+See [`API_FINDINGS.md`](API_FINDINGS.md) for notes on the live Age IV APIs,
+including how to fetch `datatype = 1` replay summary files from
+`getReplayFiles`.
+
 The harvester uses existing `games` and `participants` rows as the metadata
 source of truth. It adds replay-specific bookkeeping tables, labels candidate
 matches, downloads raw replay files slowly, and records parser status after
