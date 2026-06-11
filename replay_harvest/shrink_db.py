@@ -28,6 +28,8 @@ ESSENTIAL_TABLES = {
     "participants",
     "replay_candidate_labels",
     "replay_downloads",
+    "replay_summary_downloads",
+    "replay_summary_backfill_log",
     "replay_parse_runs",
     "top_player_identities",
     "replay_harvest_runs",

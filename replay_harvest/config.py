@@ -6,6 +6,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "aoe4.duckdb"
 REPLAY_DATA_DIR = BASE_DIR / "data" / "replays"
 RAW_REPLAY_DIR = REPLAY_DATA_DIR / "raw"
+SUMMARY_REPLAY_DIR = REPLAY_DATA_DIR / "summaries"
 PARSED_REPLAY_DIR = REPLAY_DATA_DIR / "parsed"
 REPORT_DIR = REPLAY_DATA_DIR / "reports"
 AOE4_PARSING_REPO = BASE_DIR.parent / "AOE4_Parsing"
@@ -14,6 +15,9 @@ AOE4_PARSING_CLI_PROJECT = AOE4_PARSING_REPO / "src" / "AoE4ReplayParser.Cli"
 REPLAY_DOWNLOAD_URL = (
     "https://api.ageofempires.com/api/GameStats/AgeIV/GetMatchReplay/"
     "?matchId={game_id}&profileId={profile_id}"
+)
+REPLAY_FILES_URL = (
+    "https://aoe-api.worldsedgelink.com/community/leaderboard/getReplayFiles"
 )
 
 SAMPLE_GROUP_BALANCED = "balanced_10k"

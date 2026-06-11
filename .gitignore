@@ -5,7 +5,7 @@
 # ── Replay data ───────────────────────────────────────────────────────────────
 data/replays/raw/
 data/replays/parsed/
-
+data/replays/summaries/
 # ── Generated reports, job files, and progress sidecars ───────────────────────
 data/replays/reports/
 

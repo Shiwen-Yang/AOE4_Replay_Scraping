@@ -1,6 +1,9 @@
 # AOE4 Replay Scraping
 
-Collaborative tool for harvesting Age of Empires IV replay files. One person runs the coordinator webapp to discover games and distribute work; friends download their assigned share and send back a small progress report.
+Collaborative tool for harvesting Age of Empires IV replay files and replay
+summary files. One person runs the coordinator webapp to discover games and
+distribute work; friends download their assigned share and send back a small
+progress report.
 
 ## Requirements
 
@@ -55,6 +58,10 @@ Keep one job for yourself — click **Use this job now** next to it. This saves 
 
 In Section 2, set your contact info (included in the User-Agent sent to the API — keeps requests polite and identifiable). Then click **Start Download**. You can pause and resume at any time.
 
+Each job downloads the full replay and all available per-profile summary files.
+If the full replay is already recorded as downloaded, the session still checks
+for missing summary files.
+
 ### 5. Import a friend's progress
 
 When a friend finishes, they send you a `.progress.json` file. Go to **Sync & Import → Import Friend's Progress**, upload the file, and click Import. Their games are marked done in the database and won't be re-queued in future runs.
@@ -74,7 +81,8 @@ If you copied replay files in from outside the system (e.g. from a friend's mach
 5. Click **Start Download** and let it run. You can pause and resume freely.
 6. When the session finishes, a **Download Progress Report** button appears. Download the `.progress.json` file and send it back to the coordinator.
 
-Replays are saved to `data/replays/raw/<date>/`.
+Replays are saved to `data/replays/raw/<date>/`. When available, replay
+summary files are saved to `data/replays/summaries/<date>/`.
 
 ---
 
@@ -97,6 +105,7 @@ Resetting assigned games (via **Show Assigned → Reset to pending**) removes th
 aoe4.duckdb                   game/participant metadata + download tracking
 data/replays/
   raw/<date>/                 downloaded .gz replay files
+  summaries/<date>/           downloaded per-profile replay summary .gz files
   reports/
     job_*.json                job files handed out to friends
     coordinator_*.json        coordinator's own job (saved for crash recovery)
@@ -114,3 +123,16 @@ export AOE4_REPLAY_HARVEST_USER_AGENT="AOE4ReplayHarvest/0.1 (you@example.com)"
 ```
 
 Otherwise, set your contact info in the webapp UI — it builds the User-Agent header per-session.
+
+## Backfilling replay summaries
+
+To fetch summary files for replays that are already on disk or marked
+downloaded in DuckDB, use **Backfill Replay Summaries** in the coordinator
+webapp or run:
+
+```bash
+python -m replay_harvest backfill-summaries --sleep-min 15 --sleep-max 30
+```
+
+Backfill writes one row per attempted replay to `replay_summary_backfill_log`,
+so the next run resumes with replays that have not been attempted yet.

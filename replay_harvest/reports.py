@@ -44,6 +44,29 @@ def build_report(conn: duckdb.DuckDBPyConnection) -> dict[str, object]:
         LIMIT 100
         """
     ).fetchall()
+    tables = {row[0] for row in conn.execute("SHOW TABLES").fetchall()}
+    if "replay_summary_downloads" in tables:
+        summaries_by_status = conn.execute(
+            """
+            SELECT status, count(*) AS files
+            FROM replay_summary_downloads
+            GROUP BY status
+            ORDER BY status
+            """
+        ).fetchall()
+    else:
+        summaries_by_status = []
+    if "replay_summary_backfill_log" in tables:
+        summary_backfill_by_status = conn.execute(
+            """
+            SELECT status, count(*) AS games
+            FROM replay_summary_backfill_log
+            GROUP BY status
+            ORDER BY status
+            """
+        ).fetchall()
+    else:
+        summary_backfill_by_status = []
 
     return {
         "downloads_by_status": [
@@ -61,6 +84,14 @@ def build_report(conn: duckdb.DuckDBPyConnection) -> dict[str, object]:
         "labels_by_map_top100": [
             {"sample_group": r[0], "map": r[1], "games": int(r[2])}
             for r in by_map
+        ],
+        "summaries_by_status": [
+            {"status": r[0], "files": int(r[1])}
+            for r in summaries_by_status
+        ],
+        "summary_backfill_by_status": [
+            {"status": r[0], "games": int(r[1])}
+            for r in summary_backfill_by_status
         ],
     }
 
@@ -88,4 +119,3 @@ def write_report(conn: duckdb.DuckDBPyConnection, report_dir: Path = REPORT_DIR)
         lines.append("")
     md_path.write_text("\n".join(lines), encoding="utf-8")
     return report
-

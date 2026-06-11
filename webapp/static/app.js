@@ -7,6 +7,8 @@ let eventSource = null;
 let jobTotal = 0;
 let autoScroll = true;
 let discoveryActive = false;
+let summaryBackfillActive = false;
+let summaryBackfillPollTimer = null;
 
 const MMR_TIERS = ['low', 'mid_low', 'mid', 'high', 'elite'];
 const GAP_BUCKETS = ['0-50', '51-100', '101-200', '>200'];
@@ -323,9 +325,23 @@ function setDiscoveryRunning(running, stopping = false) {
   btn.className = running || stopping ? 'danger' : 'primary';
 }
 
+function setSummaryBackfillRunning(running, stopping = false) {
+  summaryBackfillActive = running || stopping;
+  const btn = $('summary-backfill-btn');
+  if (!btn) return;
+  btn.disabled = stopping;
+  btn.textContent = stopping ? 'Stopping...' : (running ? 'Stop Summary Backfill' : 'Start Summary Backfill');
+  btn.className = running || stopping ? 'danger' : 'primary';
+}
+
 async function toggleDiscover() {
   if (discoveryActive) await stopDiscover();
   else await startDiscover();
+}
+
+async function toggleSummaryBackfill() {
+  if (summaryBackfillActive) await stopSummaryBackfill();
+  else await startSummaryBackfill();
 }
 
 // ── SSE connection ────────────────────────────────────────────────────────────
@@ -348,7 +364,7 @@ function connectSSE() {
         'ok'
       );
       setRunning(false);
-      setMsg('start-msg', 'Session complete. Start again to resume (skips already-downloaded games).', 'ok');
+      setMsg('start-msg', 'Session complete. Replay files and available summary files have been processed.', 'ok');
       eventSource.close(); eventSource = null;
 
       // Show sidecar download button on friend page
@@ -406,6 +422,12 @@ function connectSSE() {
         cls = 'warn'; icon = '⚠';
         detail = evt.message ? ` ${evt.message}` : (evt.error ? ` (${evt.error})` : '');
       }
+      if (evt.summary_status && evt.summary_status !== 'not_attempted') {
+        detail += ` summaries:${evt.summary_status}`;
+        if (evt.summary_downloaded || evt.summary_failed) {
+          detail += ` (${evt.summary_downloaded || 0} ok/${evt.summary_failed || 0} failed)`;
+        }
+      }
 
       appendLog(`${ts()} [${idx}/${total}] ${icon} ${gameId}${detail}`, cls);
 
@@ -447,6 +469,12 @@ function toggle429Sleep() {
   if (wrap) wrap.style.display = val === 'stop' ? 'none' : 'flex';
 }
 
+function toggleSummaryBackfill429Sleep() {
+  const val = $('summary-backfill-on-429')?.value;
+  const wrap = $('summary-backfill-on-429-sleep-wrap');
+  if (wrap) wrap.style.display = val === 'stop' ? 'none' : 'flex';
+}
+
 // auto-scroll toggle
 document.addEventListener('DOMContentLoaded', () => {
   const top50Input = $('top50-target');
@@ -457,6 +485,7 @@ document.addEventListener('DOMContentLoaded', () => {
   renderQuotaGrid();
   updateEstimate();
   loadQuotaInventory();
+  toggleSummaryBackfill429Sleep();
   const box = $('log-box');
   if (box) {
     box.addEventListener('scroll', () => {
@@ -482,6 +511,16 @@ document.addEventListener('DOMContentLoaded', () => {
       if (s.details) renderTierSummary(s.details, s.status);
       pollDiscovery();
       discoverPollTimer = setInterval(pollDiscovery, 2000);
+    }
+  }).catch(() => {});
+
+  fetch('/api/backfill-summaries/status').then(r => r.json()).then(s => {
+    if (s.status === 'running' || s.status === 'stopping') {
+      setSummaryBackfillRunning(true, s.status === 'stopping');
+      renderSummaryBackfillStatus(s);
+      summaryBackfillPollTimer = setInterval(pollSummaryBackfill, 2000);
+    } else if (s.status === 'done' || s.status === 'stopped' || s.status === 'error') {
+      renderSummaryBackfillStatus(s);
     }
   }).catch(() => {});
 });
@@ -1127,23 +1166,115 @@ async function reconcileDisk() {
       return;
     }
     const { scanned, newly_marked, already_known, pending_reduced } = data;
+    const summaryText = data.summary_scanned
+      ? ` Summary files: ${data.summary_newly_marked || 0} newly recorded (${data.summary_already_known || 0} already known).`
+      : '';
     if (scanned === 0) {
-      setMsg('reconcile-msg', 'No replay files found on disk.', '');
+      setMsg('reconcile-msg', summaryText || 'No replay files found on disk.', summaryText ? 'ok' : '');
     } else if (newly_marked === 0) {
       setMsg('reconcile-msg',
-        `All ${scanned} files on disk are already recorded in the database — everything is aligned.`, 'ok');
+        `All ${scanned} files on disk are already recorded in the database — everything is aligned.${summaryText}`, 'ok');
     } else if (pending_reduced === 0) {
       setMsg('reconcile-msg',
         `Scanned ${scanned} files — ${newly_marked} newly recorded (${already_known} already known). ` +
-        `None of these were in the pending list (downloaded outside the discovery system), so pending count is unchanged.`,
+        `None of these were in the pending list (downloaded outside the discovery system), so pending count is unchanged.${summaryText}`,
         'ok');
     } else {
       setMsg('reconcile-msg',
-        `Scanned ${scanned} files — ${newly_marked} newly recorded, ${pending_reduced} removed from pending list. Click "Show Pending" to see the updated count.`,
+        `Scanned ${scanned} files — ${newly_marked} newly recorded, ${pending_reduced} removed from pending list. Click "Show Pending" to see the updated count.${summaryText}`,
         'ok');
     }
   } catch (err) {
     setMsg('reconcile-msg', `Request failed: ${err}`, 'error');
+  }
+}
+
+function renderSummaryBackfillStatus(data) {
+  const counts = data.counts || {};
+  const status = data.status || 'idle';
+  const total = data.total || 0;
+  const index = data.index || 0;
+  const current = data.current_game_id ? ` current:${data.current_game_id}` : '';
+  const event = data.last_event ? ` event:${data.last_event}` : '';
+  const err = data.last_error ? ` error:${data.last_error}` : '';
+  const sleep = data.sleep_until ? ` sleep_until:${String(data.sleep_until).slice(11, 19)}` : '';
+  const prefix = status === 'running' || status === 'stopping'
+    ? `${status === 'stopping' ? 'Stopping' : 'Running'} ${index}/${total}${current}${event}${err}${sleep}`
+    : status === 'done'
+      ? `Complete ${counts.games || 0}/${total || counts.games || 0}`
+      : status === 'stopped'
+        ? `Stopped ${counts.games || 0}/${total || 0}`
+        : status === 'error'
+          ? `Error: ${data.error || 'summary backfill failed'}`
+          : 'Idle';
+  const text = `${prefix} — summaries downloaded:${counts.summary_downloaded || 0}, failed:${counts.summary_failed || 0}, skipped:${counts.summary_skipped || 0}`;
+  const logCounts = data.log_counts || {};
+  const logText = Object.keys(logCounts).length
+    ? ` Log: downloaded:${logCounts.downloaded || 0}, missing:${logCounts.missing || 0}, partial:${logCounts.partial || 0}, failed:${logCounts.failed || 0}.`
+    : '';
+  setMsg('summary-backfill-msg', text + logText, status === 'error' ? 'error' : (status === 'done' ? 'ok' : ''));
+}
+
+async function startSummaryBackfill() {
+  const sleepMin = parseFloat($('summary-backfill-sleep-min')?.value ?? 15);
+  const sleepMax = parseFloat($('summary-backfill-sleep-max')?.value ?? 30);
+  const on429 = $('summary-backfill-on-429')?.value || 'sleep';
+  const on429Minutes = parseFloat($('summary-backfill-on-429-minutes')?.value ?? 15);
+  const body = {
+    sleep_min: Number.isFinite(sleepMin) ? sleepMin : 15,
+    sleep_max: Number.isFinite(sleepMax) ? sleepMax : 30,
+    user_agent: buildUserAgent(),
+    on_429: on429,
+    on_429_minutes: Number.isFinite(on429Minutes) ? on429Minutes : 15,
+  };
+
+  setMsg('summary-backfill-msg', 'Starting summary backfill...', '');
+  try {
+    const resp = await fetch('/api/backfill-summaries/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await readApiJson(resp);
+    if (!resp.ok) {
+      setMsg('summary-backfill-msg', data.detail || 'Failed to start summary backfill.', 'error');
+      return;
+    }
+    setSummaryBackfillRunning(true);
+    if (summaryBackfillPollTimer) clearInterval(summaryBackfillPollTimer);
+    summaryBackfillPollTimer = setInterval(pollSummaryBackfill, 2000);
+    await pollSummaryBackfill();
+  } catch (err) {
+    setMsg('summary-backfill-msg', `Request failed: ${err}`, 'error');
+  }
+}
+
+async function stopSummaryBackfill() {
+  try {
+    await fetch('/api/backfill-summaries/stop', { method: 'POST' });
+    setSummaryBackfillRunning(true, true);
+    setMsg('summary-backfill-msg', 'Stop requested...', '');
+  } catch (err) {
+    setMsg('summary-backfill-msg', `Stop failed: ${err}`, 'error');
+  }
+}
+
+async function pollSummaryBackfill() {
+  try {
+    const resp = await fetch('/api/backfill-summaries/status');
+    const data = await readApiJson(resp);
+    renderSummaryBackfillStatus(data);
+    if (data.status === 'running' || data.status === 'stopping') {
+      setSummaryBackfillRunning(true, data.status === 'stopping');
+      return;
+    }
+    setSummaryBackfillRunning(false);
+    if (summaryBackfillPollTimer) {
+      clearInterval(summaryBackfillPollTimer);
+      summaryBackfillPollTimer = null;
+    }
+  } catch (err) {
+    setMsg('summary-backfill-msg', `Status failed: ${err}`, 'error');
   }
 }
 
@@ -1180,15 +1311,18 @@ async function importFriendProgress() {
       const resp = await fetch('/api/import-progress', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ job_id: jobId, downloaded, failed }),
+        body: JSON.stringify({ job_id: jobId, downloaded, failed, results }),
       });
       const data = await resp.json();
       if (!resp.ok) {
         setMsg('import-msg', data.detail || 'Import failed.', 'error');
         return;
       }
+      const summaryText = data.imported_summary_downloaded || data.imported_summary_failed
+        ? ` Summary files: ${data.imported_summary_downloaded || 0} downloaded, ${data.imported_summary_failed || 0} failed.`
+        : '';
       setMsg('import-msg',
-        `Imported: ${data.imported_downloaded} downloaded, ${data.imported_failed} failed. They won't be re-queued.`,
+        `Imported: ${data.imported_downloaded} downloaded, ${data.imported_failed} failed. They won't be re-queued.${summaryText}`,
         'ok');
     } catch (err) {
       setMsg('import-msg', `Request failed: ${err}`, 'error');

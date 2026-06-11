@@ -6,7 +6,7 @@ from pathlib import Path
 from .candidates import label_balanced_candidates, summarize_labels
 from .config import DB_PATH, SAMPLE_GROUP_BALANCED, SAMPLE_GROUP_RECENT, SAMPLE_GROUP_TOP100
 from .db import get_conn
-from .downloader import download_group
+from .downloader import backfill_summary_files, download_group
 from .outcomes import hydrate_outcomes, training_label_rows
 from .parser import parse_downloaded
 from .discovery import discover_tiered_games
@@ -65,6 +65,18 @@ def _cmd_download(args) -> None:
         conn,
         sample_group=args.group,
         limit=args.limit,
+        sleep_min=args.sleep_min,
+        sleep_max=args.sleep_max,
+    )
+    conn.close()
+    print(counts)
+
+
+def _cmd_backfill_summaries(args) -> None:
+    conn = _conn(args)
+    init_schema(conn)
+    counts = backfill_summary_files(
+        conn,
         sleep_min=args.sleep_min,
         sleep_max=args.sleep_max,
     )
@@ -203,6 +215,11 @@ def main(argv: list[str] | None = None) -> None:
     p_dl.add_argument("--sleep-min", type=float, default=15.0)
     p_dl.add_argument("--sleep-max", type=float, default=30.0)
     p_dl.set_defaults(func=_cmd_download)
+
+    p_backfill = sub.add_parser("backfill-summaries", help="Fetch replay summary files for existing downloaded replays")
+    p_backfill.add_argument("--sleep-min", type=float, default=15.0)
+    p_backfill.add_argument("--sleep-max", type=float, default=30.0)
+    p_backfill.set_defaults(func=_cmd_backfill_summaries)
 
     p_parse = sub.add_parser("parse-downloaded", help="Parse downloaded replay files and record parser status")
     p_parse.add_argument("--group", default=None, choices=[SAMPLE_GROUP_BALANCED, SAMPLE_GROUP_TOP100, SAMPLE_GROUP_RECENT])

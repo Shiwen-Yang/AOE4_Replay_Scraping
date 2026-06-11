@@ -10,7 +10,15 @@ import subprocess
 import duckdb
 
 from replay_harvest.candidates import bucket_for_rating, label_balanced_candidates
-from replay_harvest.downloader import download_group, download_job_list, download_one
+from replay_harvest.downloader import (
+    backfill_summary_files,
+    download_group,
+    download_job_list,
+    download_one,
+    download_summary_files,
+    replay_summary_items,
+    summary_backfill_game_ids,
+)
 from replay_harvest.discovery import discover_quota_games, game_cell, quota_deficits, quota_distribution, quota_inventory
 from replay_harvest.outcomes import (
     Outcome,
@@ -97,6 +105,8 @@ def test_schema_creation_creates_replay_tables():
     assert "top_player_identities" in tables
     assert "replay_parse_runs" in tables
     assert "replay_outcome_fetches" in tables
+    assert "replay_summary_downloads" in tables
+    assert "replay_summary_backfill_log" in tables
 
 
 def test_bucket_boundaries():
@@ -186,6 +196,91 @@ def test_download_one_writes_file_and_records_status(tmp_path: Path):
     assert Path(row[2]).exists()
 
 
+def test_replay_summary_items_filters_valid_summary_files():
+    payload = {
+        "replayFiles": [
+            {"profile_id": 10, "matchhistory_id": 123, "datatype": 0, "size": 99, "url": "full"},
+            {"profile_id": 10, "matchhistory_id": 123, "datatype": 1, "size": 20, "url": "summary-a"},
+            {"profile_id": 11, "matchhistory_id": 123, "datatype": 1, "size": -1, "url": "summary-b"},
+            {"profile_id": 12, "matchhistory_id": 999, "datatype": 1, "size": 20, "url": "wrong-match"},
+            {"profile_id": 13, "matchhistory_id": 123, "datatype": 1, "size": 25, "url": "summary-c"},
+        ]
+    }
+
+    items = replay_summary_items(payload, 123)
+
+    assert [(item["profile_id"], item["url"]) for item in items] == [
+        (10, "summary-a"),
+        (13, "summary-c"),
+    ]
+
+
+def test_download_summary_files_records_all_valid_profiles(tmp_path: Path):
+    conn = make_conn()
+    payload = {
+        "replayFiles": [
+            {"profile_id": 10, "matchhistory_id": 123, "datatype": 1, "size": 20, "url": "u10"},
+            {"profile_id": 11, "matchhistory_id": 123, "datatype": 1, "size": 20, "url": "u11"},
+        ]
+    }
+    data = gzip.compress(b"summary")
+
+    result = download_summary_files(
+        conn,
+        123,
+        summary_root=tmp_path,
+        replay_files_fetcher=lambda game_id: payload,
+        url_fetcher=lambda url: data,
+    )
+
+    assert result["downloaded"] == 2
+    rows = conn.execute(
+        """
+        SELECT profile_id, status, size_bytes, summary_path
+        FROM replay_summary_downloads
+        WHERE game_id = 123
+        ORDER BY profile_id
+        """
+    ).fetchall()
+    assert [(row[0], row[1], row[2]) for row in rows] == [
+        (10, "downloaded", len(data)),
+        (11, "downloaded", len(data)),
+    ]
+    assert all(Path(row[3]).exists() for row in rows)
+
+
+def test_download_one_summary_failure_does_not_fail_replay(tmp_path: Path):
+    conn = make_conn()
+    insert_game(conn, 126, 1500)
+    conn.execute(
+        """
+        INSERT INTO replay_candidate_labels
+        VALUES (126, 'balanced_10k', 'test', 0, current_timestamp)
+        """
+    )
+    payload = gzip.compress(b"replay")
+
+    status = download_one(
+        conn,
+        126,
+        "balanced_10k",
+        raw_root=tmp_path / "raw",
+        fetcher=lambda game_id, profile_id: payload,
+        harvest_summaries=True,
+        summary_root=tmp_path / "summaries",
+        replay_files_fetcher=lambda game_id: {"replayFiles": [
+            {"profile_id": 10, "matchhistory_id": 126, "datatype": 1, "size": 20, "url": "bad"}
+        ]},
+        summary_url_fetcher=lambda url: b"not gzip",
+    )
+
+    assert status == "downloaded"
+    assert conn.execute("SELECT status FROM replay_downloads WHERE game_id = 126").fetchone()[0] == "downloaded"
+    assert conn.execute(
+        "SELECT status, last_error FROM replay_summary_downloads WHERE game_id = 126 AND profile_id = 10"
+    ).fetchone()[0] == "failed"
+
+
 def test_download_group_handles_429_without_crashing(tmp_path: Path):
     conn = make_conn()
     insert_game(conn, 124, 1500)
@@ -253,6 +348,147 @@ def test_download_job_list_writes_rate_limit_event_log(tmp_path: Path):
     assert http_event["headers"]["X-RateLimit-Remaining"] == "0"
     assert http_event["headers"]["X-RateLimit-Reset"] == "1780000000"
     assert any(event["event"] == "game_result" and event["error"] == "http_429" for event in events)
+
+
+def test_download_job_list_writes_summary_results_to_sidecar(tmp_path: Path):
+    job_path = tmp_path / "job_summary.json"
+    job_path.write_text(
+        json.dumps({
+            "job_id": "job_summary",
+            "group": "recent_rm_1v1",
+            "games": [{"game_id": 127, "profile_id": 1500}],
+        })
+    )
+    replay_data = gzip.compress(b"replay")
+    summary_data = gzip.compress(b"summary")
+
+    counts = download_job_list(
+        job_path,
+        raw_root=tmp_path / "raw",
+        summary_root=tmp_path / "summaries",
+        sleep_min=0,
+        sleep_max=0,
+        fetcher=lambda game_id, profile_id, user_agent: replay_data,
+        replay_files_fetcher=lambda game_id: {"replayFiles": [
+            {"profile_id": 1500, "matchhistory_id": 127, "datatype": 1, "size": 20, "url": "summary-url"}
+        ]},
+        summary_url_fetcher=lambda url: summary_data,
+    )
+    sidecar = json.loads((tmp_path / "job_summary.progress.json").read_text())
+    result = sidecar["results"]["127"]
+
+    assert counts["downloaded"] == 1
+    assert result["status"] == "downloaded"
+    assert result["summary_status"] == "downloaded"
+    assert result["summary_downloaded"] == 1
+    assert result["summaries"][0]["profile_id"] == 1500
+    assert Path(result["summaries"][0]["path"]).exists()
+
+
+def test_download_job_list_backfills_summary_for_pre_done_replay(tmp_path: Path):
+    job_path = tmp_path / "job_predone_summary.json"
+    job_path.write_text(
+        json.dumps({
+            "job_id": "job_predone_summary",
+            "group": "recent_rm_1v1",
+            "games": [{"game_id": 131, "profile_id": 1500}],
+        })
+    )
+    summary_data = gzip.compress(b"summary")
+
+    counts = download_job_list(
+        job_path,
+        raw_root=tmp_path / "raw",
+        summary_root=tmp_path / "summaries",
+        sleep_min=0,
+        sleep_max=0,
+        fetcher=lambda game_id, profile_id, user_agent: (_ for _ in ()).throw(AssertionError("raw replay should be skipped")),
+        pre_done_ids={131},
+        replay_files_fetcher=lambda game_id: {"replayFiles": [
+            {"profile_id": 1500, "matchhistory_id": 131, "datatype": 1, "size": 20, "url": "summary-url"}
+        ]},
+        summary_url_fetcher=lambda url: summary_data,
+    )
+    sidecar = json.loads((tmp_path / "job_predone_summary.progress.json").read_text())
+    result = sidecar["results"]["131"]
+
+    assert counts["skipped"] == 1
+    assert result["status"] == "skipped"
+    assert result["summary_status"] == "downloaded"
+    assert result["summary_downloaded"] == 1
+    assert Path(result["summaries"][0]["path"]).exists()
+
+
+def test_summary_backfill_uses_downloaded_rows_and_raw_files(tmp_path: Path):
+    conn = make_conn()
+    insert_game(conn, 128, 1500)
+    conn.execute(
+        """
+        INSERT INTO replay_downloads
+        VALUES (128, 1281, 'x', current_date, current_timestamp, 'downloaded', 10, 'hash',
+                'test', 'balanced_10k', 1, NULL)
+        """
+    )
+    raw_dir = tmp_path / "raw" / "2026-06-10"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "AgeIV_Replay_129.gz").write_bytes(gzip.compress(b"replay"))
+    conn.execute(
+        """
+        INSERT INTO replay_summary_backfill_log
+        VALUES (128, 'downloaded', current_timestamp, current_timestamp, 1, 0, 0, 1, NULL)
+        """
+    )
+
+    assert summary_backfill_game_ids(conn, raw_root=tmp_path / "raw") == [129]
+    assert summary_backfill_game_ids(conn, raw_root=tmp_path / "raw", resume=False) == [128, 129]
+
+
+def test_backfill_summary_files_skips_already_recorded_profile(tmp_path: Path):
+    conn = make_conn()
+    insert_game(conn, 130, 1500)
+    conn.execute(
+        """
+        INSERT INTO replay_downloads
+        VALUES (130, 1301, 'x', current_date, current_timestamp, 'downloaded', 10, 'hash',
+                'test', 'balanced_10k', 1, NULL)
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO replay_summary_downloads
+        VALUES (130, 10, 'existing', current_timestamp, 'downloaded', 5, 'hash',
+                'test', 1, NULL)
+        """
+    )
+    summary_data = gzip.compress(b"summary")
+
+    counts = backfill_summary_files(
+        conn,
+        sleep_min=0,
+        sleep_max=0,
+        raw_root=tmp_path / "raw",
+        summary_root=tmp_path / "summaries",
+        replay_files_fetcher=lambda game_id: {"replayFiles": [
+            {"profile_id": 10, "matchhistory_id": 130, "datatype": 1, "size": 20, "url": "already"},
+            {"profile_id": 11, "matchhistory_id": 130, "datatype": 1, "size": 20, "url": "new"},
+        ]},
+        summary_url_fetcher=lambda url: summary_data,
+    )
+
+    assert counts["summary_downloaded"] == 1
+    assert counts["summary_skipped"] == 1
+    rows = conn.execute(
+        "SELECT profile_id, status FROM replay_summary_downloads WHERE game_id = 130 ORDER BY profile_id"
+    ).fetchall()
+    assert rows == [(10, "downloaded"), (11, "downloaded")]
+    log_row = conn.execute(
+        """
+        SELECT status, summary_downloaded, summary_failed, summary_skipped
+        FROM replay_summary_backfill_log
+        WHERE game_id = 130
+        """
+    ).fetchone()
+    assert log_row == ("downloaded", 1, 0, 1)
 
 
 def test_parse_one_records_success(tmp_path: Path):

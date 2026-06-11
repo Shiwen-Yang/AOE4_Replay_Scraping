@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import queue
+import random
 import re
 import sys
 import threading
@@ -10,6 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
@@ -19,9 +22,16 @@ from pydantic import BaseModel
 # Ensure replay_harvest is importable when running from any directory
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from replay_harvest.config import DB_PATH, RAW_REPLAY_DIR, REPORT_DIR, SAMPLE_GROUP_RECENT
+from replay_harvest.config import DB_PATH, RAW_REPLAY_DIR, REPORT_DIR, SAMPLE_GROUP_RECENT, SUMMARY_REPLAY_DIR
 from replay_harvest.db import get_conn
-from replay_harvest.downloader import download_job_list
+
+from replay_harvest.downloader import (
+    _record_summary_backfill_result,
+    _record_summary_backfill_start,
+    download_job_list,
+    download_summary_files,
+    summary_backfill_game_ids,
+)
 from replay_harvest.schema import init_schema
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -51,6 +61,14 @@ PENDING_JOBS: dict[str, dict] = {}
 
 # discovery background task state
 DISCOVERY: dict[str, Any] = {"status": "idle", "result": None, "error": None}
+SUMMARY_BACKFILL: dict[str, Any] = {
+    "status": "idle",
+    "counts": None,
+    "error": None,
+    "current_game_id": None,
+    "index": 0,
+    "total": 0,
+}
 TOP50_CACHE: dict[str, Any] = {"ids": set(), "fetched_at": None, "error": None}
 TOP50_CACHE_TTL = timedelta(minutes=15)
 
@@ -454,6 +472,7 @@ class ImportProgressRequest(BaseModel):
     failed: list[int]
     skipped: list[int] = []
     sample_group: str = SAMPLE_GROUP_RECENT
+    results: dict[str, Any] | None = None
 
 
 def _write_to_replay_downloads(
@@ -466,6 +485,7 @@ def _write_to_replay_downloads(
         return {"imported_downloaded": 0, "imported_failed": 0}
     conn = get_conn(DB_PATH)
     now = datetime.now(timezone.utc)
+    init_schema(conn)
     # UPDATE existing rows (e.g. assigned → downloaded/failed).
     # Never downgrade an already-downloaded game to failed.
     if downloaded:
@@ -502,17 +522,125 @@ def _write_to_replay_downloads(
     return {"imported_downloaded": len(downloaded), "imported_failed": len(failed)}
 
 
+def _write_to_summary_downloads(
+    results: dict[str, Any] | None,
+    source: str,
+) -> dict[str, int]:
+    if not results:
+        return {"imported_summary_downloaded": 0, "imported_summary_failed": 0}
+
+    downloaded_rows: list[tuple[int, int, str | None, int | None, str | None]] = []
+    failed_rows: list[tuple[int, int, str | None]] = []
+    for gid_str, record in results.items():
+        try:
+            game_id = int(gid_str)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        for summary in record.get("summaries", []) or []:
+            try:
+                profile_id = int(summary["profile_id"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            downloaded_rows.append((
+                game_id,
+                profile_id,
+                str(summary["path"]) if summary.get("path") else None,
+                int(summary["size_bytes"]) if summary.get("size_bytes") is not None else None,
+                str(summary["sha256"]) if summary.get("sha256") else None,
+            ))
+        for failure in record.get("summary_failures", []) or []:
+            try:
+                profile_id = int(failure["profile_id"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            failed_rows.append((game_id, profile_id, str(failure.get("error") or "summary_download_failed")[:200]))
+
+    if not downloaded_rows and not failed_rows:
+        return {"imported_summary_downloaded": 0, "imported_summary_failed": 0}
+
+    conn = get_conn(DB_PATH)
+    now = datetime.now(timezone.utc)
+    init_schema(conn)
+    for game_id, profile_id, path, size_bytes, sha256 in downloaded_rows:
+        existing = conn.execute(
+            """
+            SELECT attempt_count
+            FROM replay_summary_downloads
+            WHERE game_id = ? AND profile_id = ?
+            """,
+            [game_id, profile_id],
+        ).fetchone()
+        attempt_count = (int(existing[0]) if existing and existing[0] is not None else 0) + 1
+        conn.execute(
+            "DELETE FROM replay_summary_downloads WHERE game_id = ? AND profile_id = ?",
+            [game_id, profile_id],
+        )
+        conn.execute(
+            """
+            INSERT INTO replay_summary_downloads
+                (game_id, profile_id, summary_path, downloaded_at, status, size_bytes,
+                 sha256, source, attempt_count, last_error)
+            VALUES (?, ?, ?, ?, 'downloaded', ?, ?, ?, ?, NULL)
+            """,
+            [game_id, profile_id, path, now, size_bytes, sha256, source, attempt_count],
+        )
+    for game_id, profile_id, error in failed_rows:
+        existing = conn.execute(
+            """
+            SELECT attempt_count, status
+            FROM replay_summary_downloads
+            WHERE game_id = ? AND profile_id = ?
+            """,
+            [game_id, profile_id],
+        ).fetchone()
+        if existing and existing[1] == "downloaded":
+            continue
+        attempt_count = (int(existing[0]) if existing and existing[0] is not None else 0) + 1
+        conn.execute(
+            "DELETE FROM replay_summary_downloads WHERE game_id = ? AND profile_id = ?",
+            [game_id, profile_id],
+        )
+        conn.execute(
+            """
+            INSERT INTO replay_summary_downloads
+                (game_id, profile_id, summary_path, downloaded_at, status, size_bytes,
+                 sha256, source, attempt_count, last_error)
+            VALUES (?, ?, NULL, ?, 'failed', NULL, NULL, ?, ?, ?)
+            """,
+            [game_id, profile_id, now, source, attempt_count, error],
+        )
+    conn.close()
+    return {
+        "imported_summary_downloaded": len(downloaded_rows),
+        "imported_summary_failed": len(failed_rows),
+    }
+
+
 def _import_sidecar(sidecar_path: Path, sample_group: str, source: str) -> dict[str, int]:
     if not sidecar_path.exists():
-        return {"imported_downloaded": 0, "imported_failed": 0}
+        return {
+            "imported_downloaded": 0,
+            "imported_failed": 0,
+            "imported_summary_downloaded": 0,
+            "imported_summary_failed": 0,
+        }
     try:
         sidecar = json.loads(sidecar_path.read_text())
         results = sidecar.get("results", {})
         downloaded = [int(k) for k, v in results.items() if v.get("status") == "downloaded"]
         failed = [int(k) for k, v in results.items() if v.get("status") == "failed"]
-        return _write_to_replay_downloads(downloaded, failed, sample_group, source)
+        replay_result = _write_to_replay_downloads(downloaded, failed, sample_group, source)
+        summary_result = _write_to_summary_downloads(results, source)
+        return {**replay_result, **summary_result}
     except Exception:
-        return {"imported_downloaded": 0, "imported_failed": 0}
+        return {
+            "imported_downloaded": 0,
+            "imported_failed": 0,
+            "imported_summary_downloaded": 0,
+            "imported_summary_failed": 0,
+        }
 
 
 @app.post("/api/import-progress")
@@ -520,10 +648,12 @@ def api_import_progress(req: ImportProgressRequest):
     result = _write_to_replay_downloads(
         req.downloaded, req.failed, req.sample_group, "imported_from_friend"
     )
-    return result
+    summary_result = _write_to_summary_downloads(req.results, "imported_from_friend")
+    return {**result, **summary_result}
 
 
 _REPLAY_FILENAME_RE = re.compile(r"^AgeIV_Replay_(\d+)\.gz$")
+_SUMMARY_FILENAME_RE = re.compile(r"^M_(\d+)_profile_(\d+)_summary\.gz$")
 
 
 @app.post("/api/reconcile-disk")
@@ -534,11 +664,24 @@ def api_reconcile_disk():
         m = _REPLAY_FILENAME_RE.match(path.name)
         if m:
             found_ids.add(int(m.group(1)))
+    found_summaries: dict[tuple[int, int], Path] = {}
+    for path in SUMMARY_REPLAY_DIR.rglob("*.gz"):
+        m = _SUMMARY_FILENAME_RE.match(path.name)
+        if m and path.stat().st_size > 0:
+            found_summaries[(int(m.group(1)), int(m.group(2)))] = path
 
-    if not found_ids:
-        return {"scanned": 0, "newly_marked": 0, "already_known": 0}
+    if not found_ids and not found_summaries:
+        return {
+            "scanned": 0,
+            "newly_marked": 0,
+            "already_known": 0,
+            "summary_scanned": 0,
+            "summary_newly_marked": 0,
+            "summary_already_known": 0,
+        }
 
     conn = get_conn(DB_PATH)
+    init_schema(conn)
     rows = conn.execute(
         "SELECT game_id, status FROM replay_downloads"
     ).fetchall()
@@ -567,7 +710,42 @@ def api_reconcile_disk():
             [(now, gid) for gid in to_update],
         )
 
+    summary_rows = conn.execute(
+        """
+        SELECT game_id, profile_id, status
+        FROM replay_summary_downloads
+        """
+    ).fetchall()
+    already_known_summaries = {
+        (int(row[0]), int(row[1]))
+        for row in summary_rows
+        if row[2] == "downloaded"
+    }
+    summary_to_insert = set(found_summaries) - {
+        (int(row[0]), int(row[1]))
+        for row in summary_rows
+    }
+    summary_to_update = set(found_summaries) - already_known_summaries - summary_to_insert
+    for key in summary_to_insert | summary_to_update:
+        path = found_summaries[key]
+        data = path.read_bytes()
+        game_id, profile_id = key
+        conn.execute(
+            "DELETE FROM replay_summary_downloads WHERE game_id = ? AND profile_id = ?",
+            [game_id, profile_id],
+        )
+        conn.execute(
+            """
+            INSERT INTO replay_summary_downloads
+                (game_id, profile_id, summary_path, downloaded_at, status, size_bytes,
+                 sha256, source, attempt_count, last_error)
+            VALUES (?, ?, ?, ?, 'downloaded', ?, ?, 'disk_scan', 1, NULL)
+            """,
+            [game_id, profile_id, str(path), now, len(data), hashlib.sha256(data).hexdigest()],
+        )
+
     newly_marked = len(to_insert) + len(to_update)
+    summary_newly_marked = len(summary_to_insert) + len(summary_to_update)
 
     # Count how many of the newly marked were in the pending list
     pending_reduced = 0
@@ -585,7 +763,224 @@ def api_reconcile_disk():
         "newly_marked": newly_marked,
         "already_known": len(already_downloaded & found_ids),
         "pending_reduced": int(pending_reduced),
+        "summary_scanned": len(found_summaries),
+        "summary_newly_marked": summary_newly_marked,
+        "summary_already_known": len(already_known_summaries & set(found_summaries)),
     }
+
+
+class SummaryBackfillRequest(BaseModel):
+    sleep_min: float = 15.0
+    sleep_max: float = 30.0
+    user_agent: str = "AOE4ReplayHarvest/0.1 (contact@example.com)"
+    on_429: str = "sleep"
+    on_429_minutes: float = 15.0
+
+
+@app.post("/api/backfill-summaries/start")
+def api_backfill_summaries_start(req: SummaryBackfillRequest):
+    if SUMMARY_BACKFILL.get("status") in ("running", "stopping"):
+        raise HTTPException(409, "summary backfill already running")
+
+    stop_event = threading.Event()
+    SUMMARY_BACKFILL.update({
+        "status": "running",
+        "counts": {"games": 0, "summary_downloaded": 0, "summary_failed": 0, "summary_skipped": 0},
+        "error": None,
+        "current_game_id": None,
+        "index": 0,
+        "total": 0,
+        "last_event": None,
+        "last_error": None,
+        "sleep_until": None,
+        "stop_event": stop_event,
+    })
+
+    def run() -> None:
+        conn = None
+        try:
+            conn = get_conn(DB_PATH)
+            init_schema(conn)
+            game_ids = summary_backfill_game_ids(conn, raw_root=RAW_REPLAY_DIR)
+            total = len(game_ids)
+            SUMMARY_BACKFILL.update({"total": total})
+            counts = {"games": 0, "summary_downloaded": 0, "summary_failed": 0, "summary_skipped": 0}
+            for idx, game_id in enumerate(game_ids):
+                if stop_event.is_set():
+                    SUMMARY_BACKFILL.update({"status": "stopped"})
+                    break
+                SUMMARY_BACKFILL.update({
+                    "index": idx + 1,
+                    "current_game_id": game_id,
+                    "counts": dict(counts),
+                })
+                _record_summary_backfill_start(conn, game_id)
+                result: dict[str, object] | None = None
+                post_result_pause = 0.0
+                for attempt in range(2):
+                    try:
+                        SUMMARY_BACKFILL.update({
+                            "last_event": "attempt_start",
+                            "last_error": None,
+                            "sleep_until": None,
+                            "attempt": attempt + 1,
+                        })
+                        result = download_summary_files(
+                            conn,
+                            game_id,
+                            summary_root=SUMMARY_REPLAY_DIR,
+                            user_agent=req.user_agent,
+                            source="webapp_summary_backfill",
+                            skip_existing=True,
+                            raise_retryable_errors=True,
+                        )
+                        break
+                    except HTTPError as exc:
+                        error = f"http_{exc.code}"
+                        if exc.code == 429 and req.on_429 == "stop":
+                            result = {"downloaded": 0, "failed": 1, "skipped": 0, "error": error}
+                            SUMMARY_BACKFILL.update({
+                                "status": "stopping",
+                                "last_event": "rate_limited_stop",
+                                "last_error": error,
+                            })
+                            stop_event.set()
+                            break
+                        if exc.code == 429 and attempt == 0:
+                            pause = max(0.0, req.on_429_minutes * 60)
+                            SUMMARY_BACKFILL.update({
+                                "last_event": "rate_limited_sleep",
+                                "last_error": error,
+                                "sleep_until": (datetime.now(timezone.utc) + timedelta(seconds=pause)).isoformat(),
+                            })
+                            if stop_event.wait(timeout=pause):
+                                result = {"downloaded": 0, "failed": 1, "skipped": 0, "error": "stopped_during_429_sleep"}
+                                break
+                            continue
+                        if exc.code == 403:
+                            post_result_pause = 60 * 60
+                            result = {"downloaded": 0, "failed": 1, "skipped": 0, "error": error}
+                            SUMMARY_BACKFILL.update({
+                                "last_event": "http_403_pause_after_result",
+                                "last_error": error,
+                            })
+                            break
+                        if 500 <= exc.code <= 599 and attempt == 0:
+                            pause = 120
+                            SUMMARY_BACKFILL.update({
+                                "last_event": "server_error_sleep",
+                                "last_error": error,
+                                "sleep_until": (datetime.now(timezone.utc) + timedelta(seconds=pause)).isoformat(),
+                            })
+                            if stop_event.wait(timeout=pause):
+                                result = {"downloaded": 0, "failed": 1, "skipped": 0, "error": "stopped_during_server_error_sleep"}
+                                break
+                            continue
+                        result = {"downloaded": 0, "failed": 1, "skipped": 0, "error": error}
+                        break
+                    except TimeoutError:
+                        if attempt == 0:
+                            pause = 30
+                            SUMMARY_BACKFILL.update({
+                                "last_event": "timeout_sleep",
+                                "last_error": "timeout",
+                                "sleep_until": (datetime.now(timezone.utc) + timedelta(seconds=pause)).isoformat(),
+                            })
+                            if stop_event.wait(timeout=pause):
+                                result = {"downloaded": 0, "failed": 1, "skipped": 0, "error": "stopped_during_timeout_sleep"}
+                                break
+                            continue
+                        result = {"downloaded": 0, "failed": 1, "skipped": 0, "error": "timeout"}
+                        break
+                    except URLError as exc:
+                        error = f"network_error: {str(exc.reason)[:80]}"
+                        if attempt == 0:
+                            pause = 30
+                            SUMMARY_BACKFILL.update({
+                                "last_event": "network_error_sleep",
+                                "last_error": error,
+                                "sleep_until": (datetime.now(timezone.utc) + timedelta(seconds=pause)).isoformat(),
+                            })
+                            if stop_event.wait(timeout=pause):
+                                result = {"downloaded": 0, "failed": 1, "skipped": 0, "error": "stopped_during_network_sleep"}
+                                break
+                            continue
+                        result = {"downloaded": 0, "failed": 1, "skipped": 0, "error": error}
+                        break
+                if result is None:
+                    result = {"downloaded": 0, "failed": 1, "skipped": 0, "error": "stopped"}
+                _record_summary_backfill_result(conn, game_id, result)
+                counts["games"] += 1
+                counts["summary_downloaded"] += int(result.get("downloaded", 0))
+                counts["summary_failed"] += int(result.get("failed", 0))
+                counts["summary_skipped"] += int(result.get("skipped", 0))
+                SUMMARY_BACKFILL.update({
+                    "counts": dict(counts),
+                    "last_event": "game_result",
+                    "last_error": result.get("error"),
+                    "sleep_until": None,
+                })
+                if stop_event.is_set():
+                    SUMMARY_BACKFILL.update({"status": "stopped"})
+                    break
+                if post_result_pause > 0:
+                    SUMMARY_BACKFILL.update({
+                        "last_event": "http_403_sleep",
+                        "sleep_until": (datetime.now(timezone.utc) + timedelta(seconds=post_result_pause)).isoformat(),
+                    })
+                    if stop_event.wait(timeout=post_result_pause):
+                        SUMMARY_BACKFILL.update({"status": "stopped"})
+                        break
+                if idx < total - 1:
+                    pause = random.uniform(req.sleep_min, req.sleep_max)
+                    SUMMARY_BACKFILL.update({
+                        "last_event": "sleep_between_games",
+                        "sleep_until": (datetime.now(timezone.utc) + timedelta(seconds=pause)).isoformat(),
+                    })
+                    if stop_event.wait(timeout=max(0.0, pause)):
+                        SUMMARY_BACKFILL.update({"status": "stopped"})
+                        break
+            else:
+                SUMMARY_BACKFILL.update({"status": "done", "current_game_id": None, "counts": dict(counts)})
+        except Exception as exc:
+            SUMMARY_BACKFILL.update({"status": "error", "error": str(exc)})
+        finally:
+            if conn is not None:
+                conn.close()
+            SUMMARY_BACKFILL.pop("stop_event", None)
+
+    threading.Thread(target=run, daemon=True).start()
+    return {"status": "started"}
+
+
+@app.post("/api/backfill-summaries/stop")
+def api_backfill_summaries_stop():
+    stop_event = SUMMARY_BACKFILL.get("stop_event")
+    if SUMMARY_BACKFILL.get("status") != "running" or stop_event is None:
+        return {"status": SUMMARY_BACKFILL.get("status", "idle")}
+    stop_event.set()
+    SUMMARY_BACKFILL.update({"status": "stopping"})
+    return {"status": "stopping"}
+
+
+@app.get("/api/backfill-summaries/status")
+def api_backfill_summaries_status():
+    response = {k: v for k, v in SUMMARY_BACKFILL.items() if k != "stop_event"}
+    try:
+        conn = get_conn(DB_PATH, read_only=True)
+        rows = conn.execute(
+            """
+            SELECT status, count(*)
+            FROM replay_summary_backfill_log
+            GROUP BY status
+            ORDER BY status
+            """
+        ).fetchall()
+        conn.close()
+        response["log_counts"] = {str(status): int(count) for status, count in rows}
+    except Exception:
+        response["log_counts"] = {}
+    return response
 
 
 # ── Download ───────────────────────────────────────────────────────────────────
@@ -675,6 +1070,7 @@ def api_start(req: StartRequest):
         download_job_list(
             job_path=job_path,
             raw_root=RAW_REPLAY_DIR,
+            summary_root=SUMMARY_REPLAY_DIR,
             sleep_min=sleep_min,
             sleep_max=sleep_max,
             user_agent=user_agent,

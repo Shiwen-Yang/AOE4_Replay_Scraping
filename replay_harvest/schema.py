@@ -102,6 +102,34 @@ DDL = [
         PRIMARY KEY (game_id, source)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS replay_summary_downloads (
+        game_id BIGINT,
+        profile_id BIGINT,
+        summary_path VARCHAR,
+        downloaded_at TIMESTAMP,
+        status VARCHAR,
+        size_bytes BIGINT,
+        sha256 VARCHAR,
+        source VARCHAR,
+        attempt_count INTEGER,
+        last_error VARCHAR,
+        PRIMARY KEY (game_id, profile_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS replay_summary_backfill_log (
+        game_id BIGINT PRIMARY KEY,
+        status VARCHAR,
+        started_at TIMESTAMP,
+        finished_at TIMESTAMP,
+        summary_downloaded INTEGER,
+        summary_failed INTEGER,
+        summary_skipped INTEGER,
+        attempt_count INTEGER,
+        last_error VARCHAR
+    )
+    """,
 ]
 
 
@@ -113,6 +141,8 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_replay_discovery_windows_sampled ON replay_discovery_profile_windows(sampled_at)",
     "CREATE INDEX IF NOT EXISTS idx_top_player_profile ON top_player_identities(profile_id)",
     "CREATE INDEX IF NOT EXISTS idx_replay_outcomes_status ON replay_outcome_fetches(status)",
+    "CREATE INDEX IF NOT EXISTS idx_replay_summary_status ON replay_summary_downloads(status)",
+    "CREATE INDEX IF NOT EXISTS idx_replay_summary_backfill_status ON replay_summary_backfill_log(status)",
 ]
 
 

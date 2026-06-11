@@ -12,9 +12,10 @@ source of truth. It adds replay-specific bookkeeping tables, labels candidate
 matches, downloads raw replay files slowly, and records parser status after
 running the replay parser.
 
-Raw files are written under `data/replays/raw/YYYY-MM-DD/`. Parsed files are
+Raw files are written under `data/replays/raw/YYYY-MM-DD/`. Replay summary
+files are written under `data/replays/summaries/YYYY-MM-DD/`. Parsed files are
 written under `data/replays/parsed/<game_id>/`. DuckDB remains the source of
-truth for download and parse status.
+truth for download, summary, and parse status.
 
 ## Commands
 
@@ -49,7 +50,7 @@ Discover current recent RM 1v1 games from profile IDs in the old warehouse:
 python -m replay_harvest discover-recent --seed-limit 200 --per-player 25 --days 10
 ```
 
-Download labeled replays slowly:
+Download labeled replays and all available per-profile summary files slowly:
 
 ```bash
 python -m replay_harvest download --group balanced_10k --limit 1000 --sleep-min 15 --sleep-max 30
@@ -57,6 +58,18 @@ python -m replay_harvest download --group balanced_10k --limit 1000 --sleep-min 
 
 Use `--group top100_complete` to download the top-player coverage set.
 Use `--group recent_rm_1v1` to download currently discovered recent games.
+If the full replay is already marked downloaded in a webapp job, the job still
+checks for missing summary files.
+
+Fetch replay summary files for already-downloaded replays:
+
+```bash
+python -m replay_harvest backfill-summaries --sleep-min 15 --sleep-max 30
+```
+
+Backfill writes replay-level progress to `replay_summary_backfill_log`, with
+terminal statuses `downloaded`, `missing`, `partial`, and `failed`. Later runs
+resume with replays not yet present in that log.
 
 Fetch missing win/loss labels for downloaded replays:
 
@@ -92,6 +105,9 @@ Reports are written to `data/replays/reports/`.
 Downloads run as a single worker. The default command examples use 15-30 seconds
 between replay requests. Failed downloads are recorded in `replay_downloads`
 with `last_error`, and successful downloads are deduplicated by `game_id`.
+Summary files are tracked separately in `replay_summary_downloads` by
+`game_id` and `profile_id`. Replay-level backfill attempts are tracked in
+`replay_summary_backfill_log`.
 
 Set a contact-bearing User-Agent before using live APIs:
 
